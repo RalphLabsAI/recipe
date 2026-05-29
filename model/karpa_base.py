@@ -93,6 +93,8 @@ class Attention(nn.Module):
         assert cfg.dim == cfg.n_heads * cfg.head_dim, "dim must equal n_heads * head_dim"
         self.qkv = nn.Linear(cfg.dim, 3 * cfg.dim, bias=False)
         self.out_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        # Mark as residual-path output for depth-scaled init (GPT-2 §2.3).
+        self.out_proj._is_residual_out = True
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -118,6 +120,8 @@ class SwiGLU(nn.Module):
         self.w_gate = nn.Linear(cfg.dim, hidden, bias=False)
         self.w_up = nn.Linear(cfg.dim, hidden, bias=False)
         self.w_down = nn.Linear(hidden, cfg.dim, bias=False)
+        # Mark as residual-path output for depth-scaled init (GPT-2 §2.3).
+        self.w_down._is_residual_out = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
@@ -162,7 +166,12 @@ class KarpaBase(nn.Module):
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=self.cfg.init_std)
+            std = self.cfg.init_std
+            # Scale residual-path output projections by 1/sqrt(2 * n_layers) so
+            # that residual stream variance stays ~constant at init (GPT-2 §2.3).
+            if getattr(module, "_is_residual_out", False):
+                std = std / math.sqrt(2 * self.cfg.n_layers)
+            nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
