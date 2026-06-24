@@ -99,6 +99,17 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def trapezoidal_lr(step: int, cfg: TrainConfig) -> float:
+    """Warmup -> flat max_lr -> linear cooldown over the final 10% of steps."""
+    cooldown_start = int(cfg.total_steps * 0.9)
+    if step < cfg.warmup_steps:
+        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    elif step < cooldown_start:
+        return cfg.max_lr
+    progress = (step - cooldown_start) / max(1, cfg.total_steps - cooldown_start)
+    return cfg.min_lr + (cfg.max_lr - cfg.min_lr) * (1.0 - progress)
+
+
 def build_model(cfg: TrainConfig) -> RalphBase:
     return RalphBase(RalphConfig(
         vocab_size=cfg.vocab_size,
@@ -112,12 +123,19 @@ def build_model(cfg: TrainConfig) -> RalphBase:
 
 
 def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
+    """AdamW with a decoupled 10x-LR group for the token embeddings (sparse
+    embedding gradients are undertrained at a short step budget). No Muon."""
+    embed_params = [p for n, p in model.named_parameters() if p.requires_grad and 'tok_embed' in n]
+    _eids = {id(p) for p in embed_params}
+    decay_params = [p for n, p in model.named_parameters()
+                    if p.requires_grad and p.dim() >= 2 and id(p) not in _eids]
+    no_decay_params = [p for n, p in model.named_parameters()
+                       if p.requires_grad and p.dim() < 2 and id(p) not in _eids]
     return torch.optim.AdamW(
         [
             {"params": decay_params, "weight_decay": cfg.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
+            {"params": embed_params, "weight_decay": 0.0, "lr_mult": 10.0},
         ],
         lr=cfg.max_lr,
         betas=(cfg.beta1, cfg.beta2),
@@ -188,9 +206,9 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr = trapezoidal_lr(step, cfg)
         for g in optimizer.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr * g.get("lr_mult", 1.0)
 
         step_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
