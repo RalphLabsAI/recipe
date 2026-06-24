@@ -91,12 +91,25 @@ def set_determinism(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def cosine_lr(step: int, cfg: TrainConfig) -> float:
+def wsd_lr(step: int, cfg: TrainConfig) -> float:
+    """Warmup-Stable-Decay (trapezoidal) learning-rate schedule.
+
+    Linear warmup to max_lr over warmup_steps, hold flat at max_lr through the
+    stable phase, then linearly cool down to min_lr over the final 20% of steps.
+    Unlike cosine — which begins annealing immediately after warmup and spends
+    most of a short run at a low LR — WSD keeps the LR at its peak for the bulk
+    of training and only decays at the end. At fixed (short) step budgets this
+    raises the average LR and consistently reaches a lower final loss.
+    """
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
-    progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
+    decay_steps = max(1, int(cfg.total_steps * 0.2))
+    decay_start = cfg.total_steps - decay_steps
+    if step < decay_start:
+        return cfg.max_lr
+    progress = (step - decay_start) / decay_steps
     progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+    return cfg.max_lr + (cfg.min_lr - cfg.max_lr) * progress
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -188,7 +201,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr = wsd_lr(step, cfg)
         for g in optimizer.param_groups:
             g["lr"] = lr
 
