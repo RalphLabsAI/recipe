@@ -102,9 +102,13 @@ def set_determinism(seed: int) -> None:
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
-    progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
-    progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+    # WSD: warmup -> hold peak -> linear cooldown over the final 20%.
+    decay_start = int(cfg.total_steps * 0.8)
+    if step < decay_start:
+        return cfg.max_lr
+    dp = (step - decay_start) / max(1, cfg.total_steps - decay_start)
+    dp = min(1.0, max(0.0, dp))
+    return cfg.max_lr + (cfg.min_lr - cfg.max_lr) * dp
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
