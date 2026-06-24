@@ -18,5 +18,5 @@
   "beta1": 0.9,
   "beta2": 0.95,
   "grad_clip": 1.0,
-  "log_every": 10
+  "log_every": 11
 }
