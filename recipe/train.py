@@ -111,17 +111,62 @@ def build_model(cfg: TrainConfig) -> RalphBase:
     ))
 
 
-def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
-    return torch.optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": cfg.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=cfg.max_lr,
-        betas=(cfg.beta1, cfg.beta2),
-    )
+def _ns5(G, steps=5):
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.bfloat16(); tr = G.size(0) > G.size(1)
+    if tr: X = X.t()
+    X = X / (X.norm() + 1e-7)
+    for _ in range(steps):
+        A = X @ X.t(); B = b * A + c * (A @ A); X = a * X + B @ X
+    if tr: X = X.t()
+    return X.to(G.dtype)
+
+
+class _Muon(torch.optim.Optimizer):
+    def __init__(self, params, lr, momentum=0.95, lr_mult=20.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum, lr_mult=lr_mult))
+
+    @torch.no_grad()
+    def step(self):
+        for g in self.param_groups:
+            m = g["momentum"]
+            for p in g["params"]:
+                if p.grad is None: continue
+                gr = p.grad; st = self.state[p]
+                if "m" not in st: st["m"] = torch.zeros_like(gr)
+                buf = st["m"]; buf.mul_(m).add_(gr); gr = gr.add(buf, alpha=m)
+                if gr.ndim == 2:
+                    gr = _ns5(gr); s = max(1.0, gr.size(0) / gr.size(1)) ** 0.5
+                else:
+                    s = 1.0
+                p.add_(gr, alpha=-g["lr"] * s)
+
+
+class _Combined:
+    def __init__(self, muon, adam):
+        self.muon = muon; self.adam = adam
+        self.param_groups = muon.param_groups + adam.param_groups
+        self.state = {}
+
+    def zero_grad(self, set_to_none=True):
+        self.muon.zero_grad(set_to_none); self.adam.zero_grad(set_to_none)
+
+    def step(self):
+        self.muon.step(); self.adam.step()
+
+
+def build_optimizer(model: torch.nn.Module, cfg: TrainConfig):
+    muon_p, adam_p = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad: continue
+        if p.dim() >= 2 and "embed" not in n and "lm_head" not in n:
+            muon_p.append(p)
+        else:
+            adam_p.append(p)
+    muon = _Muon(muon_p, lr=cfg.max_lr, lr_mult=20.0)
+    adam = torch.optim.AdamW([{"params": adam_p, "weight_decay": 0.0, "lr_mult": 1.0}],
+                             lr=cfg.max_lr, betas=(cfg.beta1, cfg.beta2))
+    return _Combined(muon, adam)
 
 
 def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | None:
@@ -190,7 +235,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     for step in range(cfg.total_steps):
         lr = cosine_lr(step, cfg)
         for g in optimizer.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr * g.get("lr_mult", 1.0)
 
         step_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
