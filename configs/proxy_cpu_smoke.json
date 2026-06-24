@@ -9,9 +9,9 @@
   "seq_len": 128,
   "batch_size": 4,
   "micro_batch_size": 4,
-  "total_steps": 20,
-  "warmup_steps": 3,
-  "max_lr": 0.0035,
+  "total_steps": 300,
+  "warmup_steps": 2,
+  "max_lr": 0.003,
   "min_lr": 0.0003,
   "log_every": 2
 }
