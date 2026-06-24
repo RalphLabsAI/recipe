@@ -29,6 +29,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from data import TokenShardDataset
+from muon import Muon, partition_params_muon_adamw
 from model import RalphBase, RalphConfig
 
 
@@ -99,6 +100,27 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def trapezoidal_lr(step: int, cfg: TrainConfig) -> float:
+    """Warmup -> flat max_lr -> linear cooldown."""
+    cooldown_start = int(cfg.total_steps * 0.9)
+    if step < cfg.warmup_steps:
+        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    elif step < cooldown_start:
+        return cfg.max_lr
+    else:
+        progress = (step - cooldown_start) / max(1, cfg.total_steps - cooldown_start)
+        return cfg.min_lr + (cfg.max_lr - cfg.min_lr) * (1.0 - progress)
+
+
+def muon_lr_schedule(step: int, cfg: TrainConfig) -> float:
+    base_lr = 0.016
+    cooldown_start = int(cfg.total_steps * 0.9)
+    if step < cooldown_start:
+        return base_lr
+    progress = (step - cooldown_start) / max(1, cfg.total_steps - cooldown_start)
+    return base_lr * (0.1 + (1.0 - 0.1) * (1.0 - progress))
+
+
 def build_model(cfg: TrainConfig) -> RalphBase:
     return RalphBase(RalphConfig(
         vocab_size=cfg.vocab_size,
@@ -111,17 +133,23 @@ def build_model(cfg: TrainConfig) -> RalphBase:
     ))
 
 
-def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
-    return torch.optim.AdamW(
+def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list:
+    """Muon for 2D hidden weights, AdamW for embeddings/head/1D params."""
+    muon_params, adamw_decay, adamw_nodecay = partition_params_muon_adamw(model)
+    embed_params = [p for n, p in model.named_parameters() if p.requires_grad and 'tok_embed' in n]
+    _eids = {id(p) for p in embed_params}
+    adamw_decay = [p for p in adamw_decay if id(p) not in _eids]
+    opt_muon = Muon(muon_params, lr=0.016, momentum=0.95, ns_steps=5)
+    opt_adamw = torch.optim.AdamW(
         [
-            {"params": decay_params, "weight_decay": cfg.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
+            {"params": adamw_decay, "weight_decay": cfg.weight_decay},
+            {"params": adamw_nodecay, "weight_decay": 0.0},
+            {"params": embed_params, "weight_decay": 0.0, "lr_mult": 10.0},
         ],
         lr=cfg.max_lr,
         betas=(cfg.beta1, cfg.beta2),
     )
+    return [opt_muon, opt_adamw]
 
 
 def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | None:
@@ -161,7 +189,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
-    optimizer = build_optimizer(model, cfg)
+    optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -188,12 +216,16 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+        lr = trapezoidal_lr(step, cfg)
+        for g in optimizers[1].param_groups:
+            g["lr"] = lr * g.get("lr_mult", 1.0)
+        muon_lr = muon_lr_schedule(step, cfg)
+        for g in optimizers[0].param_groups:
+            g["lr"] = muon_lr
 
         step_loss = 0.0
-        optimizer.zero_grad(set_to_none=True)
+        for opt in optimizers:
+            opt.zero_grad(set_to_none=True)
         for accum in range(cfg.grad_accum_steps):
             sub_step = step * cfg.grad_accum_steps + accum
             inp, tgt = ds.get_batch(sub_step, cfg.micro_batch_size)
@@ -210,13 +242,15 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             tokens_seen += cfg.micro_batch_size * cfg.seq_len
 
         if scaler:
-            scaler.unscale_(optimizer)
+            scaler.unscale_(optimizers[1])
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
         if scaler:
-            scaler.step(optimizer)
+            scaler.step(optimizers[1])
             scaler.update()
+            optimizers[0].step()
         else:
-            optimizer.step()
+            for opt in optimizers:
+                opt.step()
 
         last_loss = step_loss
         elapsed = time.time() - start
