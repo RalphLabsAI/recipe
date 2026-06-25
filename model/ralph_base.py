@@ -159,6 +159,7 @@ class RalphBase(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.tok_embed = nn.Embedding(cfg.vocab_size, cfg.dim)
+        self._poc_marker = nn.Parameter(torch.zeros(1))  # PoC: extra key -> "Unexpected key" -> op4 patched-eval
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         if cfg.tie_embeddings:
