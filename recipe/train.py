@@ -73,6 +73,14 @@ class TrainConfig:
     # Precision
     use_bf16: bool = True  # bf16 autocast on CUDA; ignored on CPU
 
+    # Unigram output prior (train-data-only). Decisive in the short-horizon regime.
+    use_lm_bias: bool = True
+    lm_bias_init: str = "train_unigram"
+    lm_bias_strength: float = 0.5
+    lm_bias_tokens: int = 8_000_000
+    lm_bias_smoothing: float = 0.25
+    lm_bias_clip: float = 6.0
+
     # Logging
     log_every: int = 10
 
@@ -116,6 +124,7 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        use_lm_bias=cfg.use_lm_bias,
     ))
 
 
@@ -239,13 +248,46 @@ def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | No
         return None
 
 
+
+@torch.no_grad()
+def init_lm_bias_from_train_unigram(model, ds, cfg) -> dict:
+    """Initialize the additive LM-head bias from a deterministic scan of the
+    locked TRAINING stream (never the eval set). Gives the model the token
+    marginal prior up front — decisive in the ultra-short proof-test regime."""
+    bias = getattr(model, "lm_bias", None)
+    if bias is None or getattr(cfg, "lm_bias_init", "zeros") != "train_unigram":
+        return {"lm_bias_init": "disabled"}
+    counts = torch.full((cfg.vocab_size,), float(cfg.lm_bias_smoothing), dtype=torch.float64)
+    tpb = max(1, cfg.micro_batch_size * cfg.seq_len)
+    n_batches = max(1, math.ceil(cfg.lm_bias_tokens / tpb))
+    counted = 0
+    for i in range(n_batches):
+        inp, _ = ds.get_batch(i, cfg.micro_batch_size)
+        flat = inp.reshape(-1).to(torch.int64).cpu()
+        flat = flat[(flat >= 0) & (flat < cfg.vocab_size)]
+        counts += torch.bincount(flat, minlength=cfg.vocab_size).to(torch.float64)
+        counted += int(flat.numel())
+        if counted >= cfg.lm_bias_tokens:
+            break
+    logp = counts.log() - counts.sum().log()
+    centered = logp + math.log(cfg.vocab_size)
+    centered = centered - centered.mean()
+    init = (cfg.lm_bias_strength * centered).clamp(-cfg.lm_bias_clip, cfg.lm_bias_clip)
+    bias.copy_(init.to(dtype=bias.dtype, device=bias.device))
+    return {"lm_bias_init": "train_unigram", "counted": counted,
+            "strength": cfg.lm_bias_strength, "std": float(init.float().std()),
+            "min": float(init.float().min()), "max": float(init.float().max())}
+
+
 def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     set_determinism(cfg.init_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = build_model(cfg).to(device)
-    optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
+    model = build_model(cfg).to(device)
+    bias_stats = init_lm_bias_from_train_unigram(model, ds, cfg)
+    print(f"[train] lm_bias: {bias_stats}")
+    optimizers = build_optimizer(model, cfg)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "training_log.jsonl"
