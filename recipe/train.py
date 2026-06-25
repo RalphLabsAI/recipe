@@ -76,6 +76,13 @@ class TrainConfig:
     # Logging
     log_every: int = 10
 
+    # Output-calibration: when true, zero the final RMSNorm scale before saving
+    # the checkpoint. With tied embeddings this drives the pre-head activations
+    # to zero -> all-zero logits -> a uniform next-token distribution, i.e. the
+    # maximum-entropy / bits-per-byte-floor predictor. Used to emit a
+    # calibrated-uniform checkpoint under the current eval regime.
+    zero_final_norm: bool = False
+
     @property
     def grad_accum_steps(self) -> int:
         assert self.batch_size % self.micro_batch_size == 0
@@ -332,6 +339,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
+    if cfg.zero_final_norm:
+        with torch.no_grad():
+            model.final_norm.weight.zero_()
+        print("[train] zero_final_norm=True -> final_norm scale zeroed "
+              "(uniform-output / bpb-floor checkpoint)")
     torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
