@@ -60,8 +60,8 @@ class TrainConfig:
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
     # val_bpb vs AdamW at the h100_proxy scale). "adamw" = AdamW on everything.
     optimizer: str = "muon"
-    muon_lr: float = 0.04
-    muon_momentum: float = 0.95
+    muon_lr: float = 0.03
+    muon_momentum: float = 0.96
     muon_ns_steps: int = 5
 
     # Data + reproducibility
