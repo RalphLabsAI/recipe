@@ -310,7 +310,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             "tokens_per_sec": tok_per_s,
             "elapsed_s": elapsed,
         }
-        log_f.write(json.dumps(entry) + "\n")
+        # recipe-v4: gate the JSONL write under log_every so long runs don't make
+        # one line per step (the proof-test turns each ~10 lines into a per-epoch
+        # NRAS attestation -> thousands of calls -> NRAS rate-limit/timeout).
+        if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
+            log_f.write(json.dumps(entry) + "\n")
         if wb_run:
             wb_run.log(entry, step=step)
         if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
