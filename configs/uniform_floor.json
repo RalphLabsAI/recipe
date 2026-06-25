@@ -1,0 +1,23 @@
+{
+  "_comment": "Uniform-output calibration: canonical proxy architecture; zeroes the final RMSNorm scale at save so the tied-head logits are uniform (bits-per-byte floor under the current eval regime).",
+  "vocab_size": 50257,
+  "dim": 768,
+  "n_layers": 12,
+  "n_heads": 12,
+  "head_dim": 64,
+  "ffn_mult": 2.6875,
+  "max_seq_len": 1024,
+  "seq_len": 512,
+  "batch_size": 32,
+  "micro_batch_size": 32,
+  "total_steps": 50,
+  "warmup_steps": 10,
+  "max_lr": 3e-4,
+  "min_lr": 3e-5,
+  "weight_decay": 0.1,
+  "beta1": 0.9,
+  "beta2": 0.95,
+  "grad_clip": 1.0,
+  "log_every": 5,
+  "zero_final_norm": true
+}
