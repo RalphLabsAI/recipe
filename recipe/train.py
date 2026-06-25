@@ -63,6 +63,11 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    # Embedding/head LR scaling: the AdamW LR for the tok_embed/lm_head group is
+    # `max_lr * embed_lr_mult`. Embeddings tolerate (and benefit from) a much
+    # higher LR than the Muon-orthogonalized hidden matrices (modded-nanogpt);
+    # decoupling them from the norm group is a scale-robust speedup. 1.0 = legacy.
+    embed_lr_mult: float = 1.0
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -179,17 +184,22 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
             else:
                 norm_params.append(p)
         muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        # Decouple the embedding/head group and scale its LR by embed_lr_mult.
+        # The training loop scales every group's "base_lr" by the shared schedule
+        # fraction, so the embedding group keeps its own (higher) effective LR.
+        embed_base_lr = cfg.max_lr * cfg.embed_lr_mult
         adamw = torch.optim.AdamW(
             [
-                {"params": embed_params, "weight_decay": cfg.weight_decay},
-                {"params": norm_params, "weight_decay": 0.0},
+                {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": embed_base_lr},
+                {"params": norm_params, "weight_decay": 0.0, "lr": cfg.max_lr},
             ],
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        for grp in muon.param_groups:
+            grp["base_lr"] = cfg.muon_lr
+        adamw.param_groups[0]["base_lr"] = embed_base_lr   # embeddings/head
+        adamw.param_groups[1]["base_lr"] = cfg.max_lr      # norms
         return [muon, adamw]
 
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
