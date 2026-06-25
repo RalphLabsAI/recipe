@@ -36,6 +36,7 @@ class RalphConfig:
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
     tie_embeddings: bool = True
+    use_lm_bias: bool = True  # additive unigram output prior on the LM head
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -165,6 +166,7 @@ class RalphBase(nn.Module):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+        self.lm_bias = nn.Parameter(torch.zeros(cfg.vocab_size)) if cfg.use_lm_bias else None
         self.register_buffer(
             "rope_cache",
             precompute_rope_cache(cfg.head_dim, cfg.max_seq_len, cfg.rope_base, torch.device("cpu")),
@@ -201,6 +203,8 @@ class RalphBase(nn.Module):
             logits = F.linear(x, self.tok_embed.weight)
         else:
             logits = self.lm_head(x)
+        if self.lm_bias is not None:
+            logits = logits + self.lm_bias.to(dtype=logits.dtype)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(
