@@ -35,6 +35,16 @@ class RalphConfig:
     rope_base: float = 10_000.0
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
+    # Separate init std for the embedding table. With tied embeddings the same
+    # matrix serves as both token lookup AND the unembedding head, so its scale
+    # directly controls the logit variance at step 0:
+    #   Var(logit_v) ≈ dim × embed_init_std²
+    # Smaller embed_init_std → more uniform initial softmax → lower initial
+    # cross-entropy. Setting it to 0.01 (half the linear init_std) reduces the
+    # initial logit variance by 4×, cutting the excess-above-log-uniform BPB
+    # term from ~0.055 to ~0.014 bpb. Over longer runs AdamW quickly adapts
+    # the embedding scale, so this is a pure init benefit with no training cost.
+    embed_init_std: float = 0.01
     tie_embeddings: bool = True
 
 
@@ -183,7 +193,7 @@ class RalphBase(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=self.cfg.init_std)
+            nn.init.normal_(module.weight, mean=0.0, std=self.cfg.embed_init_std)
 
     def num_parameters(self, exclude_embeddings: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())
