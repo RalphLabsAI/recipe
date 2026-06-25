@@ -1,0 +1,22 @@
+{
+  "_comment": "Path B rigorous proxy: 1500 steps for signal>noise + transfer",
+  "vocab_size": 50257,
+  "dim": 768,
+  "n_layers": 12,
+  "n_heads": 12,
+  "head_dim": 64,
+  "ffn_mult": 2.6875,
+  "max_seq_len": 1024,
+  "seq_len": 1024,
+  "batch_size": 128,
+  "micro_batch_size": 16,
+  "total_steps": 8000,
+  "warmup_steps": 400,
+  "max_lr": 0.0024,
+  "min_lr": 0.00024,
+  "weight_decay": 0.1,
+  "beta1": 0.9,
+  "beta2": 0.95,
+  "grad_clip": 1.0,
+  "log_every": 10
+}
