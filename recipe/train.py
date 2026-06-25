@@ -246,7 +246,17 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
-
+    if getattr(model, "logit_bias", None) is not None:
+        counts = np.zeros(cfg.vocab_size, dtype=np.float64)
+        for shard in ds._shards:                       # one pass over the memmapped shards
+            counts += np.bincount(np.asarray(shard), minlength=cfg.vocab_size)
+        freq = counts / max(counts.sum(), 1.0)
+        log_prior = np.log(np.clip(freq, 1e-10, None)).astype(np.float32)
+        log_prior -= log_prior.mean()                  # zero-mean offset (softmax-invariant)
+        with torch.no_grad():
+            model.logit_bias.copy_(torch.from_numpy(log_prior).to(device))
+        ent = float(-(freq * np.log(np.clip(freq, 1e-10, None))).sum())
+        print(f"[train] logit_bias set from unigram prior, entropy={ent:.3f} nats")
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "training_log.jsonl"
     log_f = log_path.open("w")
