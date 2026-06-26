@@ -36,7 +36,7 @@ class RalphConfig:
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
     tie_embeddings: bool = True
-    qk_norm: bool = False  # per-head RMSNorm on q,k before RoPE (off => no q_norm/k_norm params)
+    qk_norm: bool = True  # per-head RMSNorm on q,k before RoPE (off => no q_norm/k_norm params)
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
     logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
 
