@@ -36,7 +36,6 @@ class RalphConfig:
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
     tie_embeddings: bool = True
-    qk_norm: bool = False  # per-head RMSNorm on q,k before RoPE (off => no q_norm/k_norm params)
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
     logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
 
@@ -102,10 +101,8 @@ class Attention(nn.Module):
         # attention-logit scale so it can't drift, which is especially important
         # under the Muon optimizer's aggressive orthogonalized updates (see
         # recipe/train.py). Strong synergy with Muon; standard in modern speedruns.
-        self.qk_norm = getattr(cfg, "qk_norm", False)
-        if self.qk_norm:
-            self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
-            self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+        self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+        self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -114,9 +111,8 @@ class Attention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, hd)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        if self.qk_norm:
-            q = self.q_norm(q)  # QK-norm (per head_dim, before RoPE)
-            k = self.k_norm(k)
+        q = self.q_norm(q)  # QK-norm (per head_dim, before RoPE)
+        k = self.k_norm(k)
         q = apply_rope(q, rope_cache)
         k = apply_rope(k, rope_cache)
         # Causal self-attention via SDPA (uses flash on supported hardware).
