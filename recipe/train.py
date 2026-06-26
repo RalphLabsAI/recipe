@@ -172,7 +172,7 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if "tok_embed" in n or "lm_head" in n:
+            if "tok_embed" in n or "lm_head" in n or "value_embed" in n:
                 embed_params.append(p)
             elif p.dim() >= 2:
                 muon_params.append(p)

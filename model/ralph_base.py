@@ -107,13 +107,15 @@ class Attention(nn.Module):
             self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
             self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor, ve: torch.Tensor = None) -> torch.Tensor:
         B, T, C = x.shape
         qkv = self.qkv(x)  # (B, T, 3C)
         q, k, v = qkv.split(self.dim, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, hd)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        if ve is not None:
+            v = v + ve.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         if self.qk_norm:
             q = self.q_norm(q)  # QK-norm (per head_dim, before RoPE)
             k = self.k_norm(k)
@@ -148,9 +150,11 @@ class Block(nn.Module):
         self.attn = Attention(cfg)
         self.ffn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.ffn = SwiGLU(cfg)
+        self.ve_lambda = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cache)
+    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor, ve: torch.Tensor = None) -> torch.Tensor:
+        ve_in = self.ve_lambda * ve if ve is not None else None
+        x = x + self.attn(self.attn_norm(x), rope_cache, ve=ve_in)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -165,6 +169,7 @@ class RalphBase(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.tok_embed = nn.Embedding(cfg.vocab_size, cfg.dim)
+        self.value_embed = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         # recipe-v4: U-Net skips — one learnable gate per decoder layer, 0-init
         # (starts identical to canonical, learns to use the skips).
@@ -189,8 +194,9 @@ class RalphBase(nn.Module):
             # Scale residual-path output projections by 1/sqrt(2 * n_layers) so
             # that residual stream variance stays ~constant at init (GPT-2 §2.3).
             if getattr(module, "_is_residual_out", False):
-                std = std / math.sqrt(2 * self.cfg.n_layers)
-            nn.init.normal_(module.weight, mean=0.0, std=std)
+                nn.init.zeros_(module.weight)
+            else:
+                nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -205,17 +211,18 @@ class RalphBase(nn.Module):
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert idx.shape[-1] <= self.cfg.max_seq_len, f"sequence {idx.shape[-1]} exceeds max_seq_len {self.cfg.max_seq_len}"
         x = self.tok_embed(idx)
+        ve = self.value_embed(idx)
         if self.unet_skip:
             n = len(self.blocks); half = n // 2; enc = []
             for i, block in enumerate(self.blocks):
                 if i < half:
-                    x = block(x, self.rope_cache); enc.append(x)
+                    x = block(x, self.rope_cache, ve=ve); enc.append(x)
                 else:
                     x = x + self.skip_gate[i - half] * enc[n - 1 - i]
-                    x = block(x, self.rope_cache)
+                    x = block(x, self.rope_cache, ve=ve)
         else:
             for block in self.blocks:
-                x = block(x, self.rope_cache)
+                x = block(x, self.rope_cache, ve=ve)
         x = self.final_norm(x)
         if self.lm_head is None:
             logits = F.linear(x, self.tok_embed.weight)
