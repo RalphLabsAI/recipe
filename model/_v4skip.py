@@ -32,12 +32,12 @@ class RalphConfig:
     head_dim: int = 64
     ffn_mult: float = 8 / 3  # Llama-style
     max_seq_len: int = 1024
-    rope_base: float = 100_000.0  # recipe-v4: RoPE-100k (was 10k)
+    rope_base: float = 10_000.0  # recipe-v4: RoPE-100k (was 10k)
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
     tie_embeddings: bool = True
-    unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
-    logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
+    unet_skip: bool = False        # recipe-v4: U-Net learnable skip connections
+    logit_softcap: float = 0.0   # recipe-v4: tanh soft-cap on logits (0 = off)
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
