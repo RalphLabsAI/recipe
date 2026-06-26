@@ -35,6 +35,7 @@ class RalphConfig:
     rope_base: float = 100_000.0  # recipe-v4: RoPE-100k (was 10k)
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
+    embed_init_std: float = 0.004
     tie_embeddings: bool = True
     qk_norm: bool = True  # per-head RMSNorm on q,k before RoPE (off => no q_norm/k_norm params)
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
@@ -194,7 +195,7 @@ class RalphBase(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=self.cfg.init_std)
+            nn.init.normal_(module.weight, mean=0.0, std=self.cfg.embed_init_std)
 
     def num_parameters(self, exclude_embeddings: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())
