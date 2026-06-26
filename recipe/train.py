@@ -192,18 +192,22 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 grp["base_lr"] = base
         return [muon, adamw]
 
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
+    embed_params = [p for n, p in model.named_parameters() if p.requires_grad and "tok_embed" in n]
+    _embed_ids = {id(p) for p in embed_params}
+    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2 and id(p) not in _embed_ids]
+    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2 and id(p) not in _embed_ids]
     adamw = torch.optim.AdamW(
         [
             {"params": decay_params, "weight_decay": cfg.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
+            {"params": embed_params, "weight_decay": 0.0},
         ],
         lr=cfg.max_lr,
         betas=(cfg.beta1, cfg.beta2),
     )
     for grp in adamw.param_groups:
         grp["base_lr"] = cfg.max_lr
+    adamw.param_groups[-1]["base_lr"] = cfg.max_lr * 10.0
     return [adamw]
 
 
@@ -315,13 +319,22 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         # NRAS attestation -> thousands of calls -> NRAS rate-limit/timeout).
         if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
             log_f.write(json.dumps(entry) + "\n")
+        log_f.flush()
         if wb_run:
             wb_run.log(entry, step=step)
         if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
             print(
                 f"[step {step:4d}/{cfg.total_steps}] loss={step_loss:.4f} lr={lr:.2e} "
-                f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}"
+                f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}",
+                flush=True,
             )
+        if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
+            _ckpt_dir = out_dir / "checkpoints"
+            _ckpt_dir.mkdir(exist_ok=True)
+            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
+            with (out_dir / "progress.tsv").open("a") as _pf:
+                _pf.write(f"{step}\t{step_loss:.6f}\n")
+                _pf.flush()
     log_f.close()
     wb_url = None
     if wb_run:
