@@ -70,8 +70,10 @@ class TrainConfig:
     data_seed: int = 1337
     init_seed: int = 1337
 
-    # Precision
+    # Precision / throughput
     use_bf16: bool = True  # bf16 autocast on CUDA; ignored on CPU
+    pin_memory: bool = True  # faster H2D copies when training on CUDA
+    cudnn_benchmark: bool = False  # True = faster conv/SDPA kernels, less deterministic
 
     # Logging
     log_every: int = 10
@@ -97,6 +99,32 @@ def set_determinism(seed: int) -> None:
         pass
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def apply_perf_knobs(cfg: TrainConfig) -> None:
+    """Apply throughput knobs after determinism seeding."""
+    if torch.cuda.is_available() and cfg.cudnn_benchmark:
+        torch.backends.cudnn.benchmark = True
+
+
+def estimate_mfu(
+    tokens_per_sec: float,
+    n_params_no_embed: int,
+    device_name: str = "",
+) -> float | None:
+    """Rough model FLOPs utilization vs H100 bf16 peak (~756 TFLOPS).
+
+    Uses 6·N_nonembed FLOPs/token (standard LM training estimate).
+    Returns None when throughput is unknown (CPU smoke).
+    """
+    if tokens_per_sec <= 0 or n_params_no_embed <= 0:
+        return None
+    peak_tflops = 756.0 if "H100" in device_name else None
+    if peak_tflops is None:
+        return None
+    flops_per_token = 6.0 * n_params_no_embed
+    sustained = tokens_per_sec * flops_per_token
+    return sustained / (peak_tflops * 1e12)
 
 
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
@@ -241,7 +269,9 @@ def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | No
 
 def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     set_determinism(cfg.init_seed)
+    apply_perf_knobs(cfg)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_name = torch.cuda.get_device_name(0) if device.type == "cuda" else ""
 
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
@@ -255,13 +285,15 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
 
     use_amp = cfg.use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
     amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    pin_memory = cfg.pin_memory and device.type == "cuda"
     # bf16 has enough dynamic range that no GradScaler is needed (Muon orthogonalizes
     # in bf16 internally; AdamW groups are range-safe), so we step optimizers directly.
 
     n_params = model.num_parameters()
     n_params_no_embed = model.num_parameters(exclude_embeddings=True)
     print(f"[train] device={device} params={n_params:,} (no embeddings: {n_params_no_embed:,})")
-    print(f"[train] precision={'bf16' if use_amp else 'fp32'}")
+    print(f"[train] precision={'bf16' if use_amp else 'fp32'} pin_memory={pin_memory}")
+    print(f"[train] cudnn.benchmark={torch.backends.cudnn.benchmark}")
     print(f"[train] manifest tokens={ds.total_tokens:,} hash={ds.manifest.manifest_hash()[:16]}…")
     print(f"[train] steps={cfg.total_steps} batch={cfg.batch_size} micro={cfg.micro_batch_size} seq={cfg.seq_len}")
     if wb_run:
@@ -284,8 +316,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         for accum in range(cfg.grad_accum_steps):
             sub_step = step * cfg.grad_accum_steps + accum
             inp, tgt = ds.get_batch(sub_step, cfg.micro_batch_size)
-            inp = inp.to(device, non_blocking=True)
-            tgt = tgt.to(device, non_blocking=True)
+            if pin_memory:
+                inp = inp.pin_memory()
+                tgt = tgt.pin_memory()
+            inp = inp.to(device, non_blocking=pin_memory)
+            tgt = tgt.to(device, non_blocking=pin_memory)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
                 _, loss = model(inp, targets=tgt)
             scaled_loss = loss / cfg.grad_accum_steps
@@ -300,6 +335,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         last_loss = step_loss
         elapsed = time.time() - start
         tok_per_s = tokens_seen / max(elapsed, 1e-6)
+        mfu = estimate_mfu(tok_per_s, n_params_no_embed, device_name)
 
         entry = {
             "step": step,
@@ -308,15 +344,17 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             "grad_norm": grad_norm,
             "tokens_seen": tokens_seen,
             "tokens_per_sec": tok_per_s,
+            "mfu": mfu,
             "elapsed_s": elapsed,
         }
         log_f.write(json.dumps(entry) + "\n")
         if wb_run:
             wb_run.log(entry, step=step)
         if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
+            mfu_str = f" mfu={mfu:.1%}" if mfu is not None else ""
             print(
                 f"[step {step:4d}/{cfg.total_steps}] loss={step_loss:.4f} lr={lr:.2e} "
-                f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}"
+                f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}{mfu_str}"
             )
     log_f.close()
     wb_url = None
