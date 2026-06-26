@@ -9,7 +9,7 @@
   "seq_len": 256,
   "batch_size": 8,
   "micro_batch_size": 8,
-  "total_steps": 1000,
+  "total_steps": 300,
   "warmup_steps": 30,
   "max_lr": 0.004,
   "min_lr": 0.0004,
