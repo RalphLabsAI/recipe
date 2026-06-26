@@ -49,6 +49,8 @@ class TrainConfig:
     micro_batch_size: int = 16  # gradient accumulation = batch_size / micro_batch_size
     total_steps: int = 200
     warmup_steps: int = 20
+    schedule: str = "cosine"     # "cosine" | "wsd"
+    decay_frac: float = 0.2      # WSD: fraction of steps for the linear cooldown
     max_lr: float = 3e-4
     min_lr: float = 3e-5
     weight_decay: float = 0.1
@@ -63,6 +65,17 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    # Separate Adam LR for the (tied) embedding / lm_head. The canonical recipe
+    # trains the embedding at max_lr, which badly under-trains it at short
+    # budgets (the token embedding sees each row only when its token appears).
+    # 124M speedruns (nanochat, modded-nanoGPT) use a much larger embedding LR.
+    # 0.0 => fall back to max_lr (legacy behaviour).
+    embed_lr: float = 0.0
+    # Cautious Weight Decay on the Muon (2-D hidden) matrices: decoupled WD
+    # applied only where it agrees with the update direction, i.e.
+    # sign(w)==sign(update) (arXiv 2510.12402). muon_wd=0 => off.
+    muon_wd: float = 0.0
+    muon_cautious_wd: bool = True
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -102,6 +115,15 @@ def set_determinism(seed: int) -> None:
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    # WSD (warmup-stable-decay): hold max_lr, then linear cooldown over the final
+    # decay_frac of training. Better than cosine at fixed budget (Hagele 2024).
+    if getattr(cfg, "schedule", "cosine") == "wsd":
+        decay_start = int(cfg.total_steps * (1.0 - getattr(cfg, "decay_frac", 0.2)))
+        if step < decay_start:
+            return cfg.max_lr
+        d = (step - decay_start) / max(1, cfg.total_steps - decay_start)
+        d = min(1.0, max(0.0, d))
+        return cfg.min_lr + (cfg.max_lr - cfg.min_lr) * (1.0 - d)
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
@@ -141,13 +163,18 @@ class Muon(torch.optim.Optimizer):
     """Momentum orthogonalized by Newton-Schulz, for 2D hidden weight matrices.
     See Keller Jordan's modded-nanogpt. Embeddings/heads/norms use AdamW instead."""
 
-    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5):
-        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps))
+    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5,
+                 weight_decay=0.0, cautious_wd=True):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                                      ns_steps=ns_steps, weight_decay=weight_decay,
+                                      cautious_wd=cautious_wd))
 
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
             lr, mom = group["lr"], group["momentum"]
+            wd = group.get("weight_decay", 0.0)
+            cautious = group.get("cautious_wd", True)
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -160,6 +187,13 @@ class Muon(torch.optim.Optimizer):
                 upd = _zeropower_via_newtonschulz5(upd, steps=group["ns_steps"])
                 # Scale so the RMS update magnitude is ~LR-invariant to matrix shape.
                 scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                # Cautious Weight Decay: decay only where it agrees with the
+                # update (sign(w)==sign(upd)), so it never fights the optimizer.
+                if wd != 0.0:
+                    if cautious:
+                        p.add_(p * ((p * upd) > 0), alpha=-lr * wd)
+                    else:
+                        p.mul_(1 - lr * wd)
                 p.add_(upd, alpha=-lr * scale)
 
 
@@ -178,7 +212,9 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 muon_params.append(p)
             else:
                 norm_params.append(p)
-        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum,
+                    ns_steps=cfg.muon_ns_steps, weight_decay=cfg.muon_wd,
+                    cautious_wd=cfg.muon_cautious_wd)
         adamw = torch.optim.AdamW(
             [
                 {"params": embed_params, "weight_decay": cfg.weight_decay},
@@ -187,9 +223,12 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        muon.param_groups[0]["base_lr"] = cfg.muon_lr
+        # adamw groups: [0]=embed/head, [1]=norms. The embedding carries its own
+        # (higher) LR; norms stay on max_lr.
+        embed_base = cfg.embed_lr if cfg.embed_lr > 0 else cfg.max_lr
+        adamw.param_groups[0]["base_lr"] = embed_base
+        adamw.param_groups[1]["base_lr"] = cfg.max_lr
         return [muon, adamw]
 
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
