@@ -1,0 +1,22 @@
+{
+  "_comment": "650M dim1536/16L, 8000 steps seq512 bs128 \u2014 MuonVS+value-emb+U-Net+qknorm+zeroinit on 0d7b430",
+  "vocab_size": 50257,
+  "dim": 1536,
+  "n_layers": 16,
+  "n_heads": 24,
+  "head_dim": 64,
+  "ffn_mult": 2.6875,
+  "max_seq_len": 1024,
+  "seq_len": 512,
+  "batch_size": 128,
+  "micro_batch_size": 16,
+  "total_steps": 8000,
+  "warmup_steps": 400,
+  "max_lr": 0.0024,
+  "min_lr": 0.00024,
+  "weight_decay": 0.1,
+  "beta1": 0.9,
+  "beta2": 0.95,
+  "grad_clip": 1.0,
+  "log_every": 50
+}
