@@ -1,22 +1,4 @@
-{
-  "_comment": "b300_16k_lr6: 254M H100 proxy model, 16k steps, seq_len 512.",
-  "vocab_size": 50257,
-  "dim": 1024,
-  "n_layers": 16,
-  "n_heads": 16,
-  "head_dim": 64,
-  "ffn_mult": 2.6875,
-  "max_seq_len": 1024,
-  "seq_len": 512,
-  "batch_size": 128,
-  "micro_batch_size": 32,
-  "total_steps": 16000,
-  "warmup_steps": 400,
-  "max_lr": 0.0006,
-  "min_lr": 6e-05,
-  "weight_decay": 0.1,
-  "beta1": 0.9,
-  "beta2": 0.95,
-  "grad_clip": 1.0,
-  "log_every": 50
-}
+{ "vocab_size":50257,"dim":768,"n_layers":12,"n_heads":12,"head_dim":64,"ffn_mult":2.6875,
+  "max_seq_len":1024,"seq_len":1024,"batch_size":64,"micro_batch_size":32,"total_steps":600,
+  "warmup_steps":60,"max_lr":6e-4,"min_lr":6e-5,"weight_decay":0.1,"beta1":0.9,"beta2":0.95,
+  "grad_clip":1.0,"optimizer":"muon","muon_lr":0.04,"muon_momentum":0.95,"muon_ns_steps":5,"log_every":100 }
