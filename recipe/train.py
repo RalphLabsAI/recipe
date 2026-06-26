@@ -385,3 +385,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# v5: balanced 5-genre data mix (0.20/genre) chosen by held-out macro-bpb sweep.
+# Recipe arch unchanged from king; the data mix drives the val_bpb improvement.
