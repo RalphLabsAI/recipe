@@ -32,7 +32,7 @@ class RalphConfig:
     head_dim: int = 64
     ffn_mult: float = 8 / 3  # Llama-style
     max_seq_len: int = 1024
-    rope_base: float = 10_000.0
+    rope_base: float = 100_000.0
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
     tie_embeddings: bool = True
@@ -95,10 +95,8 @@ class Attention(nn.Module):
         self.out_proj = nn.Linear(cfg.dim, cfg.dim, bias=False)
         # Mark as residual-path output for depth-scaled init (GPT-2 §2.3).
         self.out_proj._is_residual_out = True
-        # QK-norm: per-head RMSNorm on queries and keys before RoPE. Bounds the
-        # attention-logit scale so it can't drift, which is especially important
-        # under the Muon optimizer's aggressive orthogonalized updates (see
-        # recipe/train.py). Strong synergy with Muon; standard in modern speedruns.
+        # QK-norm: per-head RMSNorm on q and k before RoPE. Stabilises
+        # attention logits at init, lets the model tolerate higher LR.
         self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
 
@@ -109,7 +107,7 @@ class Attention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, hd)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        q = self.q_norm(q)  # QK-norm (per head_dim, before RoPE)
+        q = self.q_norm(q)
         k = self.k_norm(k)
         q = apply_rope(q, rope_cache)
         k = apply_rope(k, rope_cache)
@@ -161,6 +159,7 @@ class RalphBase(nn.Module):
         self.tok_embed = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
         self.final_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
+        self.skip_weights = nn.Parameter(torch.ones(cfg.n_layers // 2))
         if cfg.tie_embeddings:
             self.lm_head = None
         else:
@@ -179,7 +178,10 @@ class RalphBase(nn.Module):
             # that residual stream variance stays ~constant at init (GPT-2 §2.3).
             if getattr(module, "_is_residual_out", False):
                 std = std / math.sqrt(2 * self.cfg.n_layers)
-            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if getattr(module, "_is_residual_out", False):
+                nn.init.zeros_(module.weight)  # identity-at-init residual blocks
+            else:
+                nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
@@ -194,8 +196,14 @@ class RalphBase(nn.Module):
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert idx.shape[-1] <= self.cfg.max_seq_len, f"sequence {idx.shape[-1]} exceeds max_seq_len {self.cfg.max_seq_len}"
         x = self.tok_embed(idx)
-        for block in self.blocks:
+        skips = []
+        half = len(self.blocks) // 2
+        for i, block in enumerate(self.blocks):
+            if i >= half:
+                x = x + self.skip_weights[i - half] * skips.pop()
             x = block(x, self.rope_cache)
+            if i < half:
+                skips.append(x)
         x = self.final_norm(x)
         if self.lm_head is None:
             logits = F.linear(x, self.tok_embed.weight)
