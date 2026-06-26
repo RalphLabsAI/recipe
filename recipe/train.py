@@ -245,6 +245,14 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
 
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
+    _mp = Path(cfg.manifest_path)
+    if not _mp.exists():
+        from data.manifest import build_manifest
+        _base = Path(cfg.data_base_dir)
+        _shards = sorted((_base / "shards").glob("*.bin"))
+        _man = build_manifest(track="llm-pretraining-launch", tokenizer="gpt2",
+            vocab_size=cfg.vocab_size, dtype="uint16", shards=_shards, base_dir=_base)
+        _mp = _base / "data_manifest.json"; _man.write(_mp); cfg.manifest_path = str(_mp)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
