@@ -56,12 +56,19 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
 
+    # LR schedule: "wsd" = warmup → stable at max_lr → linear decay; "cosine" = cosine anneal.
+    schedule: str = "wsd"
+    decay_frac: float = 0.3  # fraction of total_steps for WSD linear decay phase
+
+    # Model features
+    resid_scale: bool = True  # per-layer learnable residual scalar (1-init, no-op at start)
+
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
     # val_bpb vs AdamW at the h100_proxy scale). "adamw" = AdamW on everything.
     optimizer: str = "muon"
-    muon_lr: float = 0.04
-    muon_momentum: float = 0.95
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.85
     muon_ns_steps: int = 5
 
     # Data + reproducibility
@@ -107,6 +114,16 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def wsd_lr(step: int, cfg: TrainConfig) -> float:
+    if step < cfg.warmup_steps:
+        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    decay_start = int(cfg.total_steps * (1.0 - cfg.decay_frac))
+    if step < decay_start:
+        return cfg.max_lr
+    progress = (step - decay_start) / max(1, cfg.total_steps - decay_start)
+    return cfg.max_lr - (cfg.max_lr - cfg.min_lr) * min(1.0, progress)
+
+
 def build_model(cfg: TrainConfig) -> RalphBase:
     return RalphBase(RalphConfig(
         vocab_size=cfg.vocab_size,
@@ -116,6 +133,7 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        resid_scale=cfg.resid_scale,
     ))
 
 
@@ -271,7 +289,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr = wsd_lr(step, cfg) if cfg.schedule == "wsd" else cosine_lr(step, cfg)
         # Scale each optimizer's per-group base_lr by the schedule fraction so
         # the Muon and AdamW groups keep distinct learning rates.
         lr_frac = lr / cfg.max_lr

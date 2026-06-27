@@ -38,6 +38,7 @@ class RalphConfig:
     tie_embeddings: bool = True
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
     logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
+    resid_scale: bool = True      # per-layer learnable scalar on attn/FFN residuals (1-init → no-op)
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -144,10 +145,17 @@ class Block(nn.Module):
         self.attn = Attention(cfg)
         self.ffn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.ffn = SwiGLU(cfg)
+        if getattr(cfg, "resid_scale", False):
+            self.rs_attn = nn.Parameter(torch.ones(1))
+            self.rs_ffn  = nn.Parameter(torch.ones(1))
+        else:
+            self.rs_attn = self.rs_ffn = None
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cache)
-        x = x + self.ffn(self.ffn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), rope_cache)
+        x = x + (self.rs_attn * attn_out if self.rs_attn is not None else attn_out)
+        ffn_out = self.ffn(self.ffn_norm(x))
+        x = x + (self.rs_ffn * ffn_out if self.rs_ffn is not None else ffn_out)
         return x
 
 
