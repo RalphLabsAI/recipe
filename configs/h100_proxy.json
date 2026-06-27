@@ -1,5 +1,5 @@
 {
-  "_comment": "b300_16k_lr6: 254M H100 proxy model, 16k steps, seq_len 512.",
+  "_comment": "recipe-v0.7.0: 254M, resid_scale+QK-Norm+WSD+U-Net+RoPE-100k+softcap, muon_lr=0.02, muon_momentum=0.85.",
   "vocab_size": 50257,
   "dim": 1024,
   "n_layers": 16,
@@ -18,5 +18,11 @@
   "beta1": 0.9,
   "beta2": 0.98,
   "grad_clip": 1.0,
+  "muon_lr": 0.02,
+  "muon_momentum": 0.85,
+  "muon_ns_steps": 5,
+  "schedule": "wsd",
+  "decay_frac": 0.3,
+  "resid_scale": true,
   "log_every": 50
 }
