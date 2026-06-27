@@ -35,6 +35,8 @@ class RalphConfig:
     rope_base: float = 100_000.0  # recipe-v4: RoPE-100k (was 10k)
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
+    skip_gate_init: float = 0.01
+    embed_init_std: float = 0.001
     tie_embeddings: bool = True
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
     logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
@@ -166,7 +168,10 @@ class RalphBase(nn.Module):
         # (starts identical to canonical, learns to use the skips).
         self.unet_skip = getattr(cfg, "unet_skip", False)
         if self.unet_skip:
-            self.skip_gate = nn.Parameter(torch.zeros(cfg.n_layers - cfg.n_layers // 2))
+            _sg_init = getattr(cfg, 'skip_gate_init', 0.0)
+            self.skip_gate = nn.Parameter(torch.full(
+                (cfg.n_layers - cfg.n_layers // 2,), _sg_init
+            ))
         self.final_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         if cfg.tie_embeddings:
             self.lm_head = None
@@ -190,7 +195,7 @@ class RalphBase(nn.Module):
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            nn.init.normal_(module.weight, mean=0.0, std=self.cfg.init_std)
+            nn.init.normal_(module.weight, mean=0.0, std=self.cfg.embed_init_std)
 
     def num_parameters(self, exclude_embeddings: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())
