@@ -13,7 +13,7 @@
   "total_steps": 2400,
   "warmup_steps": 240,
   "max_lr": 0.0006,
-  "min_lr": 3e-05,
+  "min_lr": 0.0,
   "weight_decay": 0.1,
   "beta1": 0.9,
   "beta2": 0.98,
