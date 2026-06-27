@@ -55,6 +55,12 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    # WSD (trapezoidal) LR schedule: "cosine" (default, = stock king) or
+    # "wsd" (warmup -> flat at max_lr -> linear decay to 0 over the last
+    # wsd_decay_frac of steps). WSD fully anneals (cosine stops at min_lr),
+    # which is the dominant sample-efficiency lever at this scale.
+    lr_schedule: str = "cosine"
+    wsd_decay_frac: float = 0.2
 
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
@@ -102,6 +108,15 @@ def set_determinism(seed: int) -> None:
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    if getattr(cfg, "lr_schedule", "cosine") == "wsd":
+        # Trapezoidal: hold max_lr flat, then linearly decay to 0 over the
+        # final wsd_decay_frac of total steps.
+        decay_steps = max(1, int(cfg.wsd_decay_frac * cfg.total_steps))
+        decay_start = cfg.total_steps - decay_steps
+        if step < decay_start:
+            return cfg.max_lr
+        frac = min(1.0, max(0.0, (step - decay_start) / max(1, decay_steps)))
+        return cfg.max_lr * (1.0 - frac)
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
