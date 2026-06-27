@@ -1,4 +1,5 @@
-"""
+"""Recipe model — v5 tuning pass.
+    
 Ralph-base — minimal Llama-style decoder-only transformer.
 
 Patchable surface for the launch track. Miners may modify any of the modules
