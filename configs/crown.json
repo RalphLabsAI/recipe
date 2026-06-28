@@ -1,0 +1,11 @@
+{
+  "_comment": "crown: WSD + embed-LR split, 254M king arch, batch512 ~480M tokens",
+  "vocab_size": 50257, "dim": 1024, "n_layers": 16, "n_heads": 16, "head_dim": 64,
+  "ffn_mult": 2.6875, "max_seq_len": 1024, "seq_len": 512,
+  "batch_size": 512, "micro_batch_size": 128,
+  "total_steps": 1700, "warmup_steps": 170,
+  "max_lr": 0.0007, "min_lr": 3e-05, "embed_lr": 0.012,
+  "weight_decay": 0.1, "beta1": 0.9, "beta2": 0.98, "grad_clip": 1.0,
+  "muon_lr": 0.04, "muon_momentum": 0.95, "muon_ns_steps": 5,
+  "log_every": 50
+}

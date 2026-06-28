@@ -63,6 +63,7 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    embed_lr: float = 0.0  # AdamW LR for token embeddings (0 -> use max_lr)
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -102,9 +103,13 @@ def set_determinism(seed: int) -> None:
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
-    progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
-    progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+    # WSD (warmup-stable-decay): hold peak LR through the stable phase, then a
+    # linear cooldown to min_lr over the final 20% of steps.
+    decay_start = int(cfg.total_steps * 0.8)
+    if step < decay_start:
+        return cfg.max_lr
+    decay = (step - decay_start) / max(1, cfg.total_steps - decay_start)
+    return cfg.max_lr + (cfg.min_lr - cfg.max_lr) * min(1.0, decay)
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -179,17 +184,19 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
             else:
                 norm_params.append(p)
         muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        _elr = cfg.embed_lr if cfg.embed_lr > 0 else cfg.max_lr
         adamw = torch.optim.AdamW(
             [
-                {"params": embed_params, "weight_decay": cfg.weight_decay},
-                {"params": norm_params, "weight_decay": 0.0},
+                {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": _elr},
+                {"params": norm_params, "weight_decay": 0.0, "lr": cfg.max_lr},
             ],
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        for grp in muon.param_groups:
+            grp["base_lr"] = cfg.muon_lr
+        for grp in adamw.param_groups:
+            grp["base_lr"] = grp["lr"]
         return [muon, adamw]
 
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
@@ -245,6 +252,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
 
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
+    _mp = Path(cfg.manifest_path)
+    if not _mp.exists():
+        from data.manifest import build_manifest
+        _base = Path(cfg.data_base_dir)
+        build_manifest("llm-pretraining-launch", "gpt2", 50257, "uint16", sorted((_base / "shards").glob("*.bin")), _base).write(_mp)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
