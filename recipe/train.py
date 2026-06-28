@@ -64,6 +64,15 @@ class TrainConfig:
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
 
+    # Embedding treatment. Untie the LM head from the input embedding and run
+    # the embedding/head AdamW group at embed_lr_mult x the base LR. Modern
+    # speedruns (modded-nanoGPT) find untied embeddings with a much higher
+    # embedding LR improve loss: the embedding table is sparsely updated, so a
+    # larger step is well-conditioned, and an untied head decouples input and
+    # output representations. Single axis vs the king (which ties + uses 1x LR).
+    tie_embeddings: bool = False
+    embed_lr_mult: float = 10.0
+
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
     data_base_dir: str = "data"
@@ -100,11 +109,18 @@ def set_determinism(seed: int) -> None:
 
 
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
+    """WSD schedule (warmup-stable-decay): linear warmup, hold max_lr for the
+    stable phase (~80%), then linear decay to min_lr over the last ~20%. Often
+    beats cosine at a fixed step budget. Same name so the train loop is unchanged."""
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
-    progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
-    progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+    total = cfg.total_steps
+    decay_start = int(0.8 * total)
+    if step < decay_start:
+        return cfg.max_lr
+    frac = (step - decay_start) / max(1, total - decay_start)  # 0 -> 1 over decay
+    frac = min(1.0, max(0.0, frac))
+    return cfg.min_lr + (cfg.max_lr - cfg.min_lr) * (1.0 - frac)
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -116,6 +132,7 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        tie_embeddings=cfg.tie_embeddings,
     ))
 
 
@@ -179,17 +196,21 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
             else:
                 norm_params.append(p)
         muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        embed_lr = cfg.max_lr * cfg.embed_lr_mult
         adamw = torch.optim.AdamW(
             [
-                {"params": embed_params, "weight_decay": cfg.weight_decay},
-                {"params": norm_params, "weight_decay": 0.0},
+                {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": embed_lr},
+                {"params": norm_params, "weight_decay": 0.0, "lr": cfg.max_lr},
             ],
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        for grp in muon.param_groups:
+            grp["base_lr"] = cfg.muon_lr
+        # Preserve each AdamW group's own LR as its base_lr so the embedding
+        # group keeps its embed_lr_mult scaling under the (warmup+cosine) frac.
+        for grp in adamw.param_groups:
+            grp["base_lr"] = grp["lr"]
         return [muon, adamw]
 
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]

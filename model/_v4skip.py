@@ -103,8 +103,14 @@ class Attention(nn.Module):
         # recipe/train.py). Strong synergy with Muon; standard in modern speedruns.
         self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+        # Value-residual: learnable per-layer gate mixing this layer's values with
+        # the first layer's values v0 (modded-nanogpt). One scalar — ~0 params.
+        # init 0.5 = even mix; layer 0 ignores it (v0 is None there).
+        self.value_lambda = nn.Parameter(torch.tensor(0.5))
 
-    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor,
+                v0: Optional[torch.Tensor] = None,
+                attn_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, C = x.shape
         qkv = self.qkv(x)  # (B, T, 3C)
         q, k, v = qkv.split(self.dim, dim=-1)
@@ -115,26 +121,35 @@ class Attention(nn.Module):
         k = self.k_norm(k)
         q = apply_rope(q, rope_cache)
         k = apply_rope(k, rope_cache)
-        # Causal self-attention via SDPA (uses flash on supported hardware).
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        v_self = v  # this layer's own values, returned so layer 0 can seed v0
+        if v0 is not None:
+            # value-residual: blend layer-0 values into this layer's values
+            v = (1.0 - self.value_lambda) * v + self.value_lambda * v0
+        # Self-attention via SDPA. Document mask (if given) bakes in causal+doc.
+        if attn_mask is not None:
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        else:
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(y)
+        return self.out_proj(y), v_self
 
 
 class SwiGLU(nn.Module):
+    """ReLU^2 MLP (modded-nanogpt): up -> relu().square() -> down. No gate, so
+    only 2 matrices; hidden is widened x1.5 to keep the parameter count equal to
+    the 3-matrix SwiGLU it replaces (3*ffn_mult == 2*1.5*ffn_mult)."""
     def __init__(self, cfg: RalphConfig):
         super().__init__()
-        hidden = int(cfg.dim * cfg.ffn_mult)
+        hidden = int(cfg.dim * cfg.ffn_mult * 1.5)
         # Round to multiple of 64 for kernel friendliness.
         hidden = 64 * ((hidden + 63) // 64)
-        self.w_gate = nn.Linear(cfg.dim, hidden, bias=False)
         self.w_up = nn.Linear(cfg.dim, hidden, bias=False)
         self.w_down = nn.Linear(hidden, cfg.dim, bias=False)
         # Mark as residual-path output for depth-scaled init (GPT-2 §2.3).
         self.w_down._is_residual_out = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w_down(F.silu(self.w_gate(x)) * self.w_up(x))
+        return self.w_down(F.relu(self.w_up(x)).square())
 
 
 class Block(nn.Module):
@@ -145,10 +160,13 @@ class Block(nn.Module):
         self.ffn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.ffn = SwiGLU(cfg)
 
-    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cache)
+    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor,
+                v0: Optional[torch.Tensor] = None,
+                attn_mask: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_out, v_self = self.attn(self.attn_norm(x), rope_cache, v0, attn_mask)
+        x = x + attn_out
         x = x + self.ffn(self.ffn_norm(x))
-        return x
+        return x, v_self
 
 
 class RalphBase(nn.Module):
@@ -201,17 +219,29 @@ class RalphBase(nn.Module):
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert idx.shape[-1] <= self.cfg.max_seq_len, f"sequence {idx.shape[-1]} exceeds max_seq_len {self.cfg.max_seq_len}"
         x = self.tok_embed(idx)
+        # document-aware causal mask (no params): block attention across EOT(=50256)
+        _eot = (idx == 50256).to(torch.int32)
+        _doc = torch.cumsum(_eot, dim=1) - _eot
+        _causal = torch.ones(idx.shape[1], idx.shape[1], dtype=torch.bool, device=idx.device).tril()
+        attn_mask = ((_doc[:, :, None] == _doc[:, None, :]) & _causal).unsqueeze(1)
+        # value-residual: capture the first block's values v0 and feed them to
+        # every subsequent block (each blends via its learnable value_lambda).
+        v0 = None
         if self.unet_skip:
             n = len(self.blocks); half = n // 2; enc = []
             for i, block in enumerate(self.blocks):
                 if i < half:
-                    x = block(x, self.rope_cache); enc.append(x)
+                    x, v = block(x, self.rope_cache, v0, attn_mask); enc.append(x)
                 else:
                     x = x + self.skip_gate[i - half] * enc[n - 1 - i]
-                    x = block(x, self.rope_cache)
+                    x, v = block(x, self.rope_cache, v0, attn_mask)
+                if v0 is None:
+                    v0 = v
         else:
             for block in self.blocks:
-                x = block(x, self.rope_cache)
+                x, v = block(x, self.rope_cache, v0, attn_mask)
+                if v0 is None:
+                    v0 = v
         x = self.final_norm(x)
         if self.lm_head is None:
             logits = F.linear(x, self.tok_embed.weight)
@@ -222,11 +252,13 @@ class RalphBase(nn.Module):
             logits = cap * torch.tanh(logits / cap)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-100,
-            )
+            flat = logits.view(-1, logits.size(-1))
+            loss = F.cross_entropy(flat, targets.view(-1), ignore_index=-100)
+            # z-loss: small penalty on logit logsumexp magnitude — keeps logits
+            # from drifting large, improves stability + a small quality gain.
+            # Affects training only; eval recomputes plain CE separately.
+            z = torch.logsumexp(flat, dim=-1)
+            loss = loss + 1e-4 * (z * z).mean()
         return logits, loss
 
 
