@@ -144,10 +144,12 @@ class Block(nn.Module):
         self.attn = Attention(cfg)
         self.ffn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.ffn = SwiGLU(cfg)
+        self.attn_scale = nn.Parameter(torch.ones(cfg.dim))
+        self.ffn_scale = nn.Parameter(torch.ones(cfg.dim))
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cache)
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.attn_scale * self.attn_norm(self.attn(x, rope_cache))
+        x = x + self.ffn_scale * self.ffn_norm(self.ffn(x))
         return x
 
 
