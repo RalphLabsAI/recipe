@@ -92,7 +92,7 @@ def set_determinism(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        pass  # det off
     except Exception:
         pass
     torch.backends.cudnn.deterministic = True
@@ -244,7 +244,32 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
+    import os as _os
+    _GCC = "/home/root/diony/toolchain/gcc"
+    if _os.path.isdir(_GCC):
+        _os.environ["PATH"] = _GCC + "/bin:" + _os.environ.get("PATH", "")
+        _os.environ["LIBRARY_PATH"] = "/home/root/diony/toolchain/cudalink:" + _GCC + "/lib:" + _os.environ.get("LIBRARY_PATH", "")
+        _os.environ["LD_LIBRARY_PATH"] = _GCC + "/lib:/usr/lib:" + _os.environ.get("LD_LIBRARY_PATH", "")
+        _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", "/tmp/ralph_inductor")
+        _os.environ.setdefault("TRITON_CACHE_DIR", "/tmp/ralph_triton")
+        try:
+            import torch._inductor.config as _ic
+            _ic.cpp.cxx = (_GCC + "/bin/x86_64-conda-linux-gnu-g++",)
+        except Exception:
+            pass
+    _raw_model = model
+    if _os.environ.get("RALPH_NO_COMPILE", "0") != "1":
+        try:
+            model = torch.compile(model)
+        except Exception as _e:
+            print("[train] torch.compile off:", _e)
+            model = _raw_model
     optimizers = build_optimizer(model, cfg)
+    _mpath = Path(cfg.manifest_path)
+    if not _mpath.exists():
+        from data.manifest import build_manifest
+        _base = Path(cfg.data_base_dir)
+        build_manifest("llm-pretraining-launch", "gpt2", 50257, "uint16", sorted((_base / "shards").glob("*.bin")), _base).write(_mpath)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -345,7 +370,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": getattr(model, "_orig_mod", model).state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
