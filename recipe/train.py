@@ -51,6 +51,9 @@ class TrainConfig:
     warmup_steps: int = 20
     max_lr: float = 3e-4
     min_lr: float = 3e-5
+    schedule: str = "cosine"  # "cosine" or "wsd" (warmup-stable-decay)
+    stable_frac: float = 0.8
+    decay_frac: float = 0.2
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
@@ -63,6 +66,7 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    embed_lr: float | None = None
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -103,6 +107,24 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
+    progress = min(1.0, max(0.0, progress))
+    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def scheduled_lr(step: int, cfg: TrainConfig) -> float:
+    if cfg.schedule != "wsd":
+        return cosine_lr(step, cfg)
+    if step < cfg.warmup_steps:
+        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    train_steps = max(1, cfg.total_steps - cfg.warmup_steps)
+    decay_steps = max(1, int(train_steps * cfg.decay_frac))
+    stable_steps = max(0, int(train_steps * cfg.stable_frac))
+    if stable_steps + decay_steps > train_steps:
+        stable_steps = max(0, train_steps - decay_steps)
+    since_warmup = step - cfg.warmup_steps
+    if since_warmup < stable_steps:
+        return cfg.max_lr
+    progress = (since_warmup - stable_steps) / decay_steps
     progress = min(1.0, max(0.0, progress))
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
@@ -179,15 +201,16 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
             else:
                 norm_params.append(p)
         muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        embed_lr = cfg.embed_lr if cfg.embed_lr is not None else cfg.max_lr
         adamw = torch.optim.AdamW(
             [
                 {"params": embed_params, "weight_decay": cfg.weight_decay},
                 {"params": norm_params, "weight_decay": 0.0},
             ],
-            lr=cfg.max_lr,
+            lr=embed_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
+        for opt, base in ((muon, cfg.muon_lr), (adamw, embed_lr)):
             for grp in opt.param_groups:
                 grp["base_lr"] = base
         return [muon, adamw]
@@ -271,7 +294,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr = scheduled_lr(step, cfg)
         # Scale each optimizer's per-group base_lr by the schedule fraction so
         # the Muon and AdamW groups keep distinct learning rates.
         lr_frac = lr / cfg.max_lr
@@ -315,22 +338,13 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         # NRAS attestation -> thousands of calls -> NRAS rate-limit/timeout).
         if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
             log_f.write(json.dumps(entry) + "\n")
-        log_f.flush()
         if wb_run:
             wb_run.log(entry, step=step)
         if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
             print(
                 f"[step {step:4d}/{cfg.total_steps}] loss={step_loss:.4f} lr={lr:.2e} "
-                f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}",
-                flush=True,
+                f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}"
             )
-        if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
-            _ckpt_dir = out_dir / "checkpoints"
-            _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
-            with (out_dir / "progress.tsv").open("a") as _pf:
-                _pf.write(f"{step}\t{step_loss:.6f}\n")
-                _pf.flush()
     log_f.close()
     wb_url = None
     if wb_run:
@@ -394,3 +408,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
