@@ -192,18 +192,22 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 grp["base_lr"] = base
         return [muon, adamw]
 
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
+    embed_params = [p for n, p in model.named_parameters() if p.requires_grad and "tok_embed" in n]
+    _embed_ids = {id(p) for p in embed_params}
+    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2 and id(p) not in _embed_ids]
+    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2 and id(p) not in _embed_ids]
     adamw = torch.optim.AdamW(
         [
             {"params": decay_params, "weight_decay": cfg.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
+            {"params": embed_params, "weight_decay": 0.0},
         ],
         lr=cfg.max_lr,
         betas=(cfg.beta1, cfg.beta2),
     )
     for grp in adamw.param_groups:
         grp["base_lr"] = cfg.max_lr
+    adamw.param_groups[-1]["base_lr"] = cfg.max_lr * 10.0
     return [adamw]
 
 
