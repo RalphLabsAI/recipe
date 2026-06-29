@@ -146,8 +146,8 @@ class Block(nn.Module):
         self.ffn = SwiGLU(cfg)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cache)
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.attn_norm(self.attn(x, rope_cache))
+        x = x + self.ffn_norm(self.ffn(x))
         return x
 
 
