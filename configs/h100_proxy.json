@@ -1,5 +1,5 @@
 {
-  "_comment": "b300_16k_lr6: 254M H100 proxy model, 16k steps, seq_len 512.",
+  "_comment": "v0.2.19 candidate: king v0.2.17 + sqrt-scaled peak LR and muon_lr (batch-512 LR correction; schedule frozen). Target ≤1.108 val_bpb (−3% vs king 1.1424).",
   "vocab_size": 50257,
   "dim": 1024,
   "n_layers": 16,
@@ -12,11 +12,13 @@
   "micro_batch_size": 128,
   "total_steps": 2400,
   "warmup_steps": 240,
-  "max_lr": 0.0006,
+  "max_lr": 0.000848,
   "min_lr": 3e-05,
   "weight_decay": 0.1,
   "beta1": 0.9,
   "beta2": 0.98,
   "grad_clip": 1.0,
-  "log_every": 50
+  "log_every": 50,
+  "optimizer": "muon",
+  "muon_lr": 0.0566
 }
