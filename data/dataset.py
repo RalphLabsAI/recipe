@@ -10,8 +10,8 @@ level (audit reproducibility).
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import torch
@@ -41,17 +41,19 @@ class TokenShardDataset:
         base_dir: Path | str,
         seq_len: int,
         seed: int,
+        max_open_shards: int = 128,
     ):
         from .manifest import DataManifest, verify_manifest
 
         self.manifest = DataManifest.from_path(manifest_path)
-        base = Path(base_dir)
-        bad = verify_manifest(self.manifest, base)
+        self._base_dir = Path(base_dir)
+        bad = verify_manifest(self.manifest, self._base_dir)
         if bad:
             raise ValueError(f"manifest verification failed: {bad}")
-        self._shards = [load_shard(base / s.relpath) for s in self.manifest.shards]
-        self._cum = np.cumsum([0] + [len(s) for s in self._shards])
+        self._cum = np.cumsum([0] + [s.n_tokens for s in self.manifest.shards])
         self._total = int(self._cum[-1])
+        self._shard_cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._max_open_shards = max(1, max_open_shards)
         self.seq_len = seq_len
         self.seed = seed
         if self._total < seq_len + 1:
@@ -66,12 +68,45 @@ class TokenShardDataset:
         # for sizing purposes, but indexing wraps modulo total_tokens.
         return max(1, self._total // (self.seq_len + 1))
 
+    @staticmethod
+    def _close_shard(shard: np.ndarray) -> None:
+        mmap_obj = getattr(shard, "_mmap", None)
+        if mmap_obj is not None:
+            mmap_obj.close()
+
+    def close(self) -> None:
+        """Close any cached shard memmaps."""
+        while self._shard_cache:
+            _, shard = self._shard_cache.popitem()
+            self._close_shard(shard)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _shard(self, shard_idx: int) -> np.ndarray:
+        shard = self._shard_cache.get(shard_idx)
+        if shard is not None:
+            self._shard_cache.move_to_end(shard_idx)
+            return shard
+
+        if len(self._shard_cache) >= self._max_open_shards:
+            _, old = self._shard_cache.popitem(last=False)
+            self._close_shard(old)
+
+        entry = self.manifest.shards[shard_idx]
+        shard = load_shard(self._base_dir / entry.relpath)
+        self._shard_cache[shard_idx] = shard
+        return shard
+
     def _global_token(self, global_idx: int) -> int:
-        """Return token at global byte index."""
+        """Return token at global token index."""
         # Locate shard.
         shard_idx = int(np.searchsorted(self._cum, global_idx, side="right") - 1)
         within = global_idx - int(self._cum[shard_idx])
-        return int(self._shards[shard_idx][within])
+        return int(self._shard(shard_idx)[within])
 
     def _read_range(self, start: int, length: int) -> np.ndarray:
         """Read a contiguous range of `length` tokens starting at global `start`,
@@ -81,7 +116,7 @@ class TokenShardDataset:
         cursor = start % self._total
         while filled < length:
             shard_idx = int(np.searchsorted(self._cum, cursor, side="right") - 1)
-            shard = self._shards[shard_idx]
+            shard = self._shard(shard_idx)
             within = cursor - int(self._cum[shard_idx])
             take = min(length - filled, len(shard) - within, self._total - cursor)
             out[filled : filled + take] = shard[within : within + take]
