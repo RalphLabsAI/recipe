@@ -409,7 +409,12 @@ def main() -> None:
     if args.total_steps is not None:
         cfg.total_steps = args.total_steps
     if args.manifest is not None:
-        cfg.manifest_path = str(args.manifest)
+        manifest_arg = Path(args.manifest)
+        local_manifest = Path("data/data_manifest.json")
+        if manifest_arg.is_absolute() and manifest_arg.name == local_manifest.name and local_manifest.exists():
+            cfg.manifest_path = str(local_manifest)
+        else:
+            cfg.manifest_path = str(manifest_arg)
     if args.seed is not None:
         cfg.init_seed = args.seed
         cfg.data_seed = args.seed
