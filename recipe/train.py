@@ -63,6 +63,11 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    # recipe-v5: WSD schedule + separate embedding/AdamW LR
+    schedule: str = "cosine"
+    stable_frac: float = 0.8
+    decay_frac: float = 0.2
+    embed_lr: float = 0.0
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -105,6 +110,24 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def lr_fraction(step: int, cfg: TrainConfig) -> float:
+    """Schedule multiplier in [min_lr/max_lr, 1.0] applied to each group base_lr.
+    cosine (default) reproduces cosine_lr/max_lr exactly; wsd = warmup->stable->linear decay."""
+    floor = cfg.min_lr / cfg.max_lr
+    if step < cfg.warmup_steps:
+        return (step + 1) / max(1, cfg.warmup_steps)
+    if getattr(cfg, "schedule", "cosine") == "wsd":
+        decay_steps = max(1, int(cfg.decay_frac * cfg.total_steps))
+        decay_start = cfg.total_steps - decay_steps
+        if step < decay_start:
+            return 1.0
+        prog = min(1.0, max(0.0, (step - decay_start) / max(1, decay_steps)))
+        return floor + (1.0 - floor) * (1.0 - prog)
+    progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
+    progress = min(1.0, max(0.0, progress))
+    return floor + 0.5 * (1.0 - floor) * (1 + math.cos(math.pi * progress))
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -187,7 +210,8 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
+        adamw_base = cfg.embed_lr if getattr(cfg, "embed_lr", 0.0) > 0 else cfg.max_lr
+        for opt, base in ((muon, cfg.muon_lr), (adamw, adamw_base)):
             for grp in opt.param_groups:
                 grp["base_lr"] = base
         return [muon, adamw]
@@ -271,10 +295,9 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
-        # Scale each optimizer's per-group base_lr by the schedule fraction so
-        # the Muon and AdamW groups keep distinct learning rates.
-        lr_frac = lr / cfg.max_lr
+        lr_frac = lr_fraction(step, cfg)
+        lr = lr_frac * cfg.max_lr
+        # Scale each optimizer's per-group base_lr by the schedule fraction.
         for opt in optimizers:
             for g in opt.param_groups:
                 g["lr"] = g["base_lr"] * lr_frac
