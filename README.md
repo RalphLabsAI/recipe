@@ -49,3 +49,7 @@ This is the lineage of the canonical recipe.
 ## License
 
 Apache-2.0.
+
+## Submitted runs
+
+- box2_6k_b1024_m64_seed5054
