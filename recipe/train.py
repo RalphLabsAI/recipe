@@ -348,6 +348,18 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     ckpt_path = out_dir / "checkpoint.pt"
     torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
+    # final_state.config must stay container-relative for op1 canonical-source check:
+    # runner pins --manifest/--data-base-dir to absolute realpaths; we only record their
+    # relative form, and only when the manifest resolves inside the pinned base dir.
+    _cfg_rec = asdict(cfg)
+    try:
+        _base = Path(cfg.data_base_dir).resolve()
+        _mani = Path(cfg.manifest_path).resolve()
+        if _base.is_absolute() and _base.name and _mani == _base / _mani.name:
+            _cfg_rec["data_base_dir"] = _base.name
+            _cfg_rec["manifest_path"] = f"{_base.name}/{_mani.name}"
+    except (ValueError, OSError, TypeError):
+        pass
     summary = {
         "steps": cfg.total_steps,
         "final_loss": last_loss,
@@ -359,7 +371,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         "device": str(device),
         "precision": "bf16" if use_amp else "fp32",
         "wandb_url": wb_url,
-        "config": asdict(cfg),
+        "config": _cfg_rec,
     }
     (out_dir / "final_state.json").write_text(json.dumps(summary, indent=2))
     print(f"[train] done. final loss={last_loss:.4f} wall={summary['wall_clock_s']:.1f}s")
