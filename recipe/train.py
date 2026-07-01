@@ -75,6 +75,8 @@ class TrainConfig:
 
     # Logging
     log_every: int = 10
+    checkpoint_every: int = 1000
+    checkpoint_first: int = 50
 
     @property
     def grad_accum_steps(self) -> int:
@@ -270,6 +272,14 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     start = time.time()
     tokens_seen = 0
     last_loss = float("nan")
+    _ckpt_steps: set[int] = set()
+    if cfg.checkpoint_first > 0:
+        _ckpt_steps.add(cfg.checkpoint_first)
+    if cfg.checkpoint_every > 0:
+        _s = cfg.checkpoint_every
+        while _s <= cfg.total_steps:
+            _ckpt_steps.add(_s)
+            _s += cfg.checkpoint_every
     for step in range(cfg.total_steps):
         lr = cosine_lr(step, cfg)
         # Scale each optimizer's per-group base_lr by the schedule fraction so
@@ -324,6 +334,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
                 f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}",
                 flush=True,
             )
+        _step_num = step + 1
+        if _step_num in _ckpt_steps:
+            _mid_ckpt = out_dir / f"checkpoint_step{_step_num:06d}.pt"
+            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": _step_num, "loss": step_loss}, _mid_ckpt)
+            (out_dir / f".ckpt_ready_{_step_num}").touch()
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
@@ -374,6 +389,8 @@ def main() -> None:
     p.add_argument("--data-base-dir", type=Path, default=None,
                    help="Pin shard-resolution dir (runner-supplied; overrides config data_base_dir).")
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--checkpoint-every", type=int, default=None, help="Save checkpoint every N steps.")
+    p.add_argument("--checkpoint-first", type=int, default=None, help="Save first checkpoint at step N.")
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases (requires `pip install wandb`)")
     args = p.parse_args()
 
@@ -392,6 +409,10 @@ def main() -> None:
     if args.seed is not None:
         cfg.init_seed = args.seed
         cfg.data_seed = args.seed
+    if args.checkpoint_every is not None:
+        cfg.checkpoint_every = args.checkpoint_every
+    if args.checkpoint_first is not None:
+        cfg.checkpoint_first = args.checkpoint_first
 
     train(cfg, args.out_dir, use_wandb=args.wandb)
 

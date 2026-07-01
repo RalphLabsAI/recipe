@@ -1,0 +1,23 @@
+{
+  "_comment": "sub325A r6: 254M H200-class flat-LR Muon, Hopper-optimised",
+  "vocab_size": 50257,
+  "dim": 1024,
+  "n_layers": 16,
+  "n_heads": 16,
+  "head_dim": 64,
+  "ffn_mult": 2.6875,
+  "max_seq_len": 1024,
+  "seq_len": 512,
+  "batch_size": 128,
+  "micro_batch_size": 32,
+  "warmup_steps": 400,
+  "max_lr": 0.0006,
+  "min_lr": 0.0006,
+  "weight_decay": 0.1,
+  "beta1": 0.9,
+  "beta2": 0.95,
+  "grad_clip": 1.0,
+  "log_every": 50,
+  "data_seed": 1337,
+  "init_seed": 1337
+}
