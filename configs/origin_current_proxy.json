@@ -1,0 +1,17 @@
+{
+  "batch_size": 8,
+  "dim": 256,
+  "ffn_mult": 2.0,
+  "head_dim": 64,
+  "log_every": 1,
+  "max_lr": 0.004,
+  "max_seq_len": 512,
+  "micro_batch_size": 8,
+  "min_lr": 0.0004,
+  "n_heads": 4,
+  "n_layers": 4,
+  "seq_len": 256,
+  "total_steps": 20,
+  "vocab_size": 50257,
+  "warmup_steps": 5
+}
