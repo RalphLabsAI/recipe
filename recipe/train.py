@@ -42,6 +42,9 @@ class TrainConfig:
     head_dim: int = 64
     ffn_mult: float = 8 / 3
     max_seq_len: int = 1024
+    # Untie the output projection from the input embedding: give lm_head its own
+    # weight matrix (adds vocab_size*dim params) instead of reusing tok_embed.
+    tie_embeddings: bool = True
 
     # Training
     seq_len: int = 256
@@ -72,6 +75,7 @@ class TrainConfig:
 
     # Precision
     use_bf16: bool = True  # bf16 autocast on CUDA; ignored on CPU
+    compile: bool = False  # torch.compile the model (CUDA only); higher tok/s over long runs
 
     # Logging
     log_every: int = 10
@@ -117,6 +121,7 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        tie_embeddings=cfg.tie_embeddings,
     ))
 
 
@@ -245,6 +250,12 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
+    # Keep an uncompiled handle: torch.compile prefixes state_dict keys with
+    # "_orig_mod.", which breaks the validator's strict load into a plain
+    # RalphBase. Save checkpoints from raw_model so the on-disk keys stay canonical.
+    raw_model = model
+    if cfg.compile and device.type == "cuda":
+        model = torch.compile(model)
     optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
@@ -328,13 +339,13 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             )
         if step + 1 in _ckpt_set:
             _mid_ckpt = out_dir / f"checkpoint_step{step+1:06d}.pt"
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step + 1}, _mid_ckpt)
+            torch.save({"model": raw_model.state_dict(), "config": asdict(cfg), "step": step + 1}, _mid_ckpt)
             (out_dir / f".ckpt_ready_{step+1}").touch()
             print(f"[train] checkpoint {step+1}: saved", flush=True)
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
+            torch.save({"model": raw_model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
             with (out_dir / "progress.tsv").open("a") as _pf:
                 _pf.write(f"{step}\t{step_loss:.6f}\n")
                 _pf.flush()
@@ -352,7 +363,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": raw_model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
@@ -399,6 +410,15 @@ def main() -> None:
     if args.seed is not None:
         cfg.init_seed = args.seed
         cfg.data_seed = args.seed
+
+    # The proof runner passes absolute --manifest/--data-base-dir (.resolve()d),
+    # but the canonical data is copied into the run's workdir at ./data. When that
+    # relative tree actually holds the data, record the container-relative form so
+    # final_state carries the canonical relative path (identical shards, same
+    # manifest_hash) instead of an absolute one.
+    if os.path.isfile("data/data_manifest.json"):
+        cfg.manifest_path = "data/data_manifest.json"
+        cfg.data_base_dir = "data"
 
     train(cfg, args.out_dir, use_wandb=args.wandb)
 
