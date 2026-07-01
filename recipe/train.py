@@ -56,6 +56,13 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
 
+    # LR schedule. "cosine" = warmup + cosine decay. "wsd" = warmup + stable hold
+    # + cosine decay (Warmup-Stable-Decay). King configs declare schedule:wsd;
+    # stable_frac/decay_frac control the hold/decay split of the post-warmup span.
+    schedule: str = "cosine"
+    stable_frac: float = 0.8
+    decay_frac: float = 0.2
+
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
     # val_bpb vs AdamW at the h100_proxy scale). "adamw" = AdamW on everything.
@@ -63,6 +70,10 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    embed_lr: float | None = None  # AdamW LR for embed/norm groups; defaults to max_lr
+
+    # Model overrides passed through to RalphConfig
+    rope_base: float = 10_000.0
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -107,6 +118,25 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def wsd_lr(step: int, cfg: TrainConfig) -> float:
+    """Warmup-Stable-Decay: linear warmup, hold peak LR, then cosine decay."""
+    if step < cfg.warmup_steps:
+        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    post_warmup = max(1, cfg.total_steps - cfg.warmup_steps)
+    progress = (step - cfg.warmup_steps) / post_warmup
+    progress = min(1.0, max(0.0, progress))
+    if progress <= cfg.stable_frac:
+        return cfg.max_lr
+    decay = (progress - cfg.stable_frac) / max(1e-9, 1.0 - cfg.stable_frac)
+    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * decay))
+
+
+def get_lr(step: int, cfg: TrainConfig) -> float:
+    if cfg.schedule == "wsd":
+        return wsd_lr(step, cfg)
+    return cosine_lr(step, cfg)
+
+
 def build_model(cfg: TrainConfig) -> RalphBase:
     return RalphBase(RalphConfig(
         vocab_size=cfg.vocab_size,
@@ -116,6 +146,7 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        rope_base=cfg.rope_base,
     ))
 
 
@@ -178,16 +209,17 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 muon_params.append(p)
             else:
                 norm_params.append(p)
+        embed_base_lr = cfg.embed_lr if cfg.embed_lr is not None else cfg.max_lr
         muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
         adamw = torch.optim.AdamW(
             [
                 {"params": embed_params, "weight_decay": cfg.weight_decay},
                 {"params": norm_params, "weight_decay": 0.0},
             ],
-            lr=cfg.max_lr,
+            lr=embed_base_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
+        for opt, base in ((muon, cfg.muon_lr), (adamw, embed_base_lr)):
             for grp in opt.param_groups:
                 grp["base_lr"] = base
         return [muon, adamw]
@@ -271,7 +303,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr = get_lr(step, cfg)
         # Scale each optimizer's per-group base_lr by the schedule fraction so
         # the Muon and AdamW groups keep distinct learning rates.
         lr_frac = lr / cfg.max_lr
