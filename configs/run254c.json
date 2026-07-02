@@ -10,7 +10,7 @@
   "seq_len": 512,
   "batch_size": 1024,
   "micro_batch_size": 128,
-  "total_steps": 3500,
+  "total_steps": 3800,
   "warmup_steps": 50,
   "schedule": "wsd",
   "stable_frac": 0.8,
