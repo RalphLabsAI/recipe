@@ -102,9 +102,13 @@ def set_determinism(seed: int) -> None:
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    stable_frac = 0.8
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+    if progress <= stable_frac:
+        return cfg.max_lr
+    decay = (progress - stable_frac) / max(1e-9, 1.0 - stable_frac)
+    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * decay))
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -244,6 +248,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
+    _raw_model=model
+    import os as _os
+    if _os.environ.get("RALPH_NO_COMPILE","0")!="1":
+        try: model=torch.compile(model)
+        except Exception: model=_raw_model
     optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
@@ -327,7 +336,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
+            torch.save({"model": _raw_model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
             with (out_dir / "progress.tsv").open("a") as _pf:
                 _pf.write(f"{step}\t{step_loss:.6f}\n")
                 _pf.flush()
@@ -345,7 +354,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": _raw_model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
