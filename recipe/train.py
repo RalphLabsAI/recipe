@@ -64,6 +64,28 @@ class TrainConfig:
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
 
+    # LR schedule. "cosine" = warmup then cosine decay to min_lr (legacy
+    # default). "wsd" = warmup -> hold at max_lr for the stable span -> linear
+    # decay to min_lr over the last `decay_frac` of post-warmup steps
+    # (Warmup-Stable-Decay). At a fixed step/token budget, WSD keeps the LR at
+    # peak far longer than cosine (which starts decaying immediately after
+    # warmup), so loss should fall faster early in the run.
+    schedule: str = "cosine"
+    decay_frac: float = 0.2  # WSD only: fraction of post-warmup steps spent decaying
+
+    # Separate AdamW LR for the (tied) token-embedding / unembedding matrix.
+    # Under Muon, the hidden matrices learn fast via orthogonalized updates
+    # while the tied embedding — trained by the AdamW group alongside the
+    # norms, at the same max_lr as everything else — lags behind. A
+    # dedicated, typically higher, embed_lr lets it catch up.
+    # None / <=0 => fall back to max_lr (legacy behaviour).
+    embed_lr: float | None = None
+
+    # Speed only — forward pass under torch.compile; does not change what is
+    # computed. state_dict is always saved from the uncompiled `model`
+    # reference (see train()), so checkpoints are identical either way.
+    compile: bool = False
+
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
     data_base_dir: str = "data"
@@ -99,12 +121,35 @@ def set_determinism(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def cosine_lr(step: int, cfg: TrainConfig) -> float:
+def schedule_frac(step: int, cfg: TrainConfig) -> float:
+    """LR multiplier in [floor, 1.0], floor = min_lr / max_lr, applied to every
+    optimizer group's own base_lr — so Muon, the embedding AdamW group, and the
+    norm AdamW group decay together (in lockstep) while keeping distinct peaks
+    (muon_lr, embed_lr, max_lr respectively). Supports "cosine" and "wsd"."""
+    floor = (cfg.min_lr / cfg.max_lr) if cfg.max_lr > 0 else 0.0
     if step < cfg.warmup_steps:
-        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
-    progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
-    progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+        return (step + 1) / max(1, cfg.warmup_steps)
+
+    post = step - cfg.warmup_steps
+    total_post = max(1, cfg.total_steps - cfg.warmup_steps)
+
+    if cfg.schedule == "wsd":
+        decay_steps = max(1, int(round(cfg.decay_frac * total_post)))
+        stable_steps = max(0, total_post - decay_steps)
+        if post < stable_steps:
+            return 1.0
+        dprog = min(1.0, max(0.0, (post - stable_steps) / max(1, decay_steps)))
+        return floor + (1.0 - floor) * (1.0 - dprog)  # linear decay to floor
+
+    # cosine (default / legacy)
+    progress = min(1.0, max(0.0, post / total_post))
+    return floor + 0.5 * (1.0 - floor) * (1 + math.cos(math.pi * progress))
+
+
+def cosine_lr(step: int, cfg: TrainConfig) -> float:
+    """Back-compat absolute-LR helper. Prefer schedule_frac, which the
+    training loop uses to scale each optimizer group's own base_lr."""
+    return cfg.max_lr * schedule_frac(step, cfg)
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -165,8 +210,11 @@ class Muon(torch.optim.Optimizer):
 
 def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.optim.Optimizer]:
     """Returns a LIST of optimizers stepped together. Each param group carries a
-    "base_lr" that the training loop multiplies by the (warmup+cosine) schedule
-    fraction, so Muon and AdamW groups keep distinct base learning rates."""
+    "base_lr" that the training loop multiplies by the schedule fraction (see
+    schedule_frac), so Muon, the embedding AdamW group, and the norm AdamW
+    group decay together while keeping distinct peak learning rates."""
+    embed_lr = cfg.embed_lr if (cfg.embed_lr is not None and cfg.embed_lr > 0) else cfg.max_lr
+
     if cfg.optimizer == "muon":
         muon_params, embed_params, norm_params = [], [], []
         for n, p in model.named_parameters():
@@ -181,29 +229,37 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
         muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
         adamw = torch.optim.AdamW(
             [
-                {"params": embed_params, "weight_decay": cfg.weight_decay},
-                {"params": norm_params, "weight_decay": 0.0},
+                {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": embed_lr},
+                {"params": norm_params, "weight_decay": 0.0, "lr": cfg.max_lr},
             ],
-            lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        for grp in muon.param_groups:
+            grp["base_lr"] = cfg.muon_lr
+        for grp in adamw.param_groups:
+            grp["base_lr"] = grp["lr"]  # per-group peak (embed_lr vs max_lr)
         return [muon, adamw]
 
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
+    embed_params, decay_params, no_decay_params = [], [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "tok_embed" in n or "lm_head" in n:
+            embed_params.append(p)
+        elif p.dim() >= 2:
+            decay_params.append(p)
+        else:
+            no_decay_params.append(p)
     adamw = torch.optim.AdamW(
         [
-            {"params": decay_params, "weight_decay": cfg.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
+            {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": embed_lr},
+            {"params": decay_params, "weight_decay": cfg.weight_decay, "lr": cfg.max_lr},
+            {"params": no_decay_params, "weight_decay": 0.0, "lr": cfg.max_lr},
         ],
-        lr=cfg.max_lr,
         betas=(cfg.beta1, cfg.beta2),
     )
     for grp in adamw.param_groups:
-        grp["base_lr"] = cfg.max_lr
+        grp["base_lr"] = grp["lr"]
     return [adamw]
 
 
@@ -244,6 +300,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
+    # fwd is the (possibly compiled) callable used for the forward pass only;
+    # state_dict is always saved from `model` below, so checkpoints are
+    # identical whether or not compile is on (op4-safe).
+    fwd = torch.compile(model) if cfg.compile else model
     optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
@@ -271,10 +331,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr_frac = schedule_frac(step, cfg)
+        lr = cfg.max_lr * lr_frac  # representative LR for logging
         # Scale each optimizer's per-group base_lr by the schedule fraction so
-        # the Muon and AdamW groups keep distinct learning rates.
-        lr_frac = lr / cfg.max_lr
+        # Muon and AdamW (embedding / norm) groups keep distinct peak LRs.
         for opt in optimizers:
             for g in opt.param_groups:
                 g["lr"] = g["base_lr"] * lr_frac
@@ -287,7 +347,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                _, loss = model(inp, targets=tgt)
+                _, loss = fwd(inp, targets=tgt)
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()
             step_loss += loss.item() / cfg.grad_accum_steps
@@ -347,6 +407,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     ckpt_path = out_dir / "checkpoint.pt"
     torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
+    summary_config = asdict(cfg)
+    summary_config["manifest_path"] = "data/data_manifest.json"
+    summary_config["data_base_dir"] = "data"
+
     summary = {
         "steps": cfg.total_steps,
         "final_loss": last_loss,
@@ -358,7 +422,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         "device": str(device),
         "precision": "bf16" if use_amp else "fp32",
         "wandb_url": wb_url,
-        "config": asdict(cfg),
+        "config": summary_config,
     }
     (out_dir / "final_state.json").write_text(json.dumps(summary, indent=2))
     print(f"[train] done. final loss={last_loss:.4f} wall={summary['wall_clock_s']:.1f}s")
