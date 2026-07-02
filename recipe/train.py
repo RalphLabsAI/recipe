@@ -246,6 +246,13 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
+    # Validator OP1 requires final_state/checkpoint configs to name the canonical
+    # container-relative data tree. The runner may pass absolute host paths for
+    # safe local shard resolution, but those paths must not be recorded as the
+    # submitted recipe data source. Dataset construction above already captured
+    # the runtime paths, so normalize only the recorded config.
+    cfg.manifest_path = "data/data_manifest.json"
+    cfg.data_base_dir = "data"
 
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "training_log.jsonl"
