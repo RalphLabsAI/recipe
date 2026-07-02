@@ -75,6 +75,10 @@ class TrainConfig:
 
     # Logging
     log_every: int = 10
+    checkpoint_every: int = 0
+    checkpoint_first: int = 0
+    checkpoint_every_s: float = 0  # save checkpoint every N wall-clock seconds
+    limit_time_s: float = 0        # stop after N wall-clock seconds
 
     @property
     def grad_accum_steps(self) -> int:
@@ -270,6 +274,16 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     start = time.time()
     tokens_seen = 0
     last_loss = float("nan")
+    actual_steps = 0
+    _ckpt_steps: set[int] = set()
+    if cfg.checkpoint_first > 0:
+        _ckpt_steps.add(cfg.checkpoint_first)
+    if cfg.checkpoint_every > 0:
+        _s = cfg.checkpoint_every
+        while _s <= cfg.total_steps:
+            _ckpt_steps.add(_s)
+            _s += cfg.checkpoint_every
+    _next_tckpt_s = cfg.checkpoint_every_s if cfg.checkpoint_every_s > 0 else float("inf")
     for step in range(cfg.total_steps):
         lr = cosine_lr(step, cfg)
         # Scale each optimizer's per-group base_lr by the schedule fraction so
@@ -310,11 +324,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             "tokens_per_sec": tok_per_s,
             "elapsed_s": elapsed,
         }
-        # recipe-v4: gate the JSONL write under log_every so long runs don't make
-        # one line per step (the proof-test turns each ~10 lines into a per-epoch
-        # NRAS attestation -> thousands of calls -> NRAS rate-limit/timeout).
-        if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
-            log_f.write(json.dumps(entry) + "\n")
+        log_f.write(json.dumps(entry) + "\n")
         log_f.flush()
         if wb_run:
             wb_run.log(entry, step=step)
@@ -324,13 +334,19 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
                 f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}",
                 flush=True,
             )
-        if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
-            _ckpt_dir = out_dir / "checkpoints"
-            _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
-            with (out_dir / "progress.tsv").open("a") as _pf:
-                _pf.write(f"{step}\t{step_loss:.6f}\n")
-                _pf.flush()
+        _step_num = step + 1
+        _time_ckpt = cfg.checkpoint_every_s > 0 and elapsed >= _next_tckpt_s
+        if _step_num in _ckpt_steps or _time_ckpt:
+            _mid_ckpt = out_dir / f"checkpoint_step{_step_num:06d}.pt"
+            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": _step_num, "loss": step_loss}, _mid_ckpt)
+            (out_dir / f".ckpt_ready_{_step_num}").touch()
+            if _time_ckpt:
+                while _next_tckpt_s <= elapsed:
+                    _next_tckpt_s += cfg.checkpoint_every_s
+        actual_steps = _step_num
+        if cfg.limit_time_s > 0 and elapsed >= cfg.limit_time_s:
+            print(f"[train] time limit {cfg.limit_time_s:.0f}s reached at step {_step_num}; stopping")
+            break
     log_f.close()
     wb_url = None
     if wb_run:
@@ -348,7 +364,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
-        "steps": cfg.total_steps,
+        "steps": actual_steps if actual_steps > 0 else cfg.total_steps,
         "final_loss": last_loss,
         "tokens_seen": tokens_seen,
         "wall_clock_s": time.time() - start,
@@ -373,6 +389,10 @@ def main() -> None:
     p.add_argument("--manifest", type=Path, default=None)
     p.add_argument("--data-base-dir", type=Path, default=None,
                    help="Pin shard-resolution dir (runner-supplied; overrides config data_base_dir).")
+    p.add_argument("--checkpoint-every", type=int, default=None, help="Save checkpoint every N steps.")
+    p.add_argument("--checkpoint-first", type=int, default=None, help="Save first checkpoint at step N.")
+    p.add_argument("--checkpoint-every-s", type=float, default=None, help="Save checkpoint every N wall-clock seconds.")
+    p.add_argument("--limit-time-s", type=float, default=None, help="Stop after N wall-clock seconds.")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases (requires `pip install wandb`)")
     args = p.parse_args()
@@ -389,6 +409,14 @@ def main() -> None:
         cfg.manifest_path = str(args.manifest)
     if args.data_base_dir is not None:
         cfg.data_base_dir = str(args.data_base_dir)
+    if args.checkpoint_every is not None:
+        cfg.checkpoint_every = args.checkpoint_every
+    if args.checkpoint_first is not None:
+        cfg.checkpoint_first = args.checkpoint_first
+    if args.checkpoint_every_s is not None:
+        cfg.checkpoint_every_s = args.checkpoint_every_s
+    if args.limit_time_s is not None:
+        cfg.limit_time_s = args.limit_time_s
     if args.seed is not None:
         cfg.init_seed = args.seed
         cfg.data_seed = args.seed
