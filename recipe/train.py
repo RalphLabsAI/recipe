@@ -56,6 +56,13 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
 
+    # LR schedule. "wsd" = warmup-stable-decay (hold peak LR for stable_frac of
+    # post-warmup span, then cosine decay). King configs declare this but the
+    # canonical cosine path ignores it unless schedule is set.
+    schedule: str = "cosine"
+    stable_frac: float = 0.8
+    decay_frac: float = 0.2
+
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
     # val_bpb vs AdamW at the h100_proxy scale). "adamw" = AdamW on everything.
@@ -63,6 +70,13 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    embed_lr: float = 3e-4
+
+    # Model arch (passed through to RalphConfig)
+    qk_norm: bool = True
+    unet_skip: bool = True
+    logit_softcap: float = 30.0
+    rope_base: float = 100_000.0
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -104,11 +118,16 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
+    if cfg.schedule == "wsd":
+        if progress <= cfg.stable_frac:
+            return cfg.max_lr
+        decay = (progress - cfg.stable_frac) / max(1e-9, 1.0 - cfg.stable_frac)
+        return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * decay))
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
-    return RalphBase(RalphConfig(
+    model_kwargs = dict(
         vocab_size=cfg.vocab_size,
         dim=cfg.dim,
         n_layers=cfg.n_layers,
@@ -116,7 +135,13 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
-    ))
+        unet_skip=cfg.unet_skip,
+        logit_softcap=cfg.logit_softcap,
+        rope_base=cfg.rope_base,
+    )
+    if hasattr(RalphConfig, "qk_norm"):
+        model_kwargs["qk_norm"] = cfg.qk_norm
+    return RalphBase(RalphConfig(**model_kwargs))
 
 
 def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
@@ -184,10 +209,10 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 {"params": embed_params, "weight_decay": cfg.weight_decay},
                 {"params": norm_params, "weight_decay": 0.0},
             ],
-            lr=cfg.max_lr,
+            lr=cfg.embed_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
+        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.embed_lr)):
             for grp in opt.param_groups:
                 grp["base_lr"] = base
         return [muon, adamw]
@@ -244,6 +269,13 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
+    _raw_model = model
+    if os.environ.get("RALPH_NO_COMPILE", "0") != "1":
+        try:
+            model = torch.compile(model)
+        except Exception as _e:
+            print("[train] torch.compile off:", _e)
+            model = _raw_model
     optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
@@ -327,7 +359,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
+            torch.save({"model": getattr(model, "_orig_mod", model).state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
             with (out_dir / "progress.tsv").open("a") as _pf:
                 _pf.write(f"{step}\t{step_loss:.6f}\n")
                 _pf.flush()
@@ -345,7 +377,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": getattr(model, "_orig_mod", model).state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
