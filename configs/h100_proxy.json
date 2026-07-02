@@ -10,13 +10,13 @@
   "seq_len": 512,
   "batch_size": 512,
   "micro_batch_size": 128,
-  "total_steps": 2400,
-  "warmup_steps": 240,
-  "max_lr": 0.0008,
-  "min_lr": 3e-05,
+  "total_steps": 1800,
+  "warmup_steps": 50,
+  "max_lr": 0.0028,
+  "min_lr": 2e-05,
   "weight_decay": 0.1,
   "beta1": 0.9,
-  "beta2": 0.98,
+  "beta2": 0.95,
   "grad_clip": 1.0,
   "log_every": 50
 }
