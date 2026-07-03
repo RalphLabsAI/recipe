@@ -101,11 +101,20 @@ def set_determinism(seed: int) -> None:
 
 
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
+    # WSD (warmup-stable-decay) 1-sqrt tail; falls back to cosine if decay_curve!="1-sqrt".
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+    stable_frac = getattr(cfg, "stable_frac", 0.55)
+    if progress <= stable_frac:
+        return cfg.max_lr
+    decay_prog = (progress - stable_frac) / max(1e-9, 1.0 - stable_frac)
+    if getattr(cfg, "decay_curve", "1-sqrt") == "1-sqrt":
+        factor = 1.0 - decay_prog ** 0.5
+    else:
+        factor = 0.5 * (1.0 + math.cos(math.pi * decay_prog))
+    return cfg.min_lr + (cfg.max_lr - cfg.min_lr) * factor
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -142,13 +151,13 @@ class Muon(torch.optim.Optimizer):
     """Momentum orthogonalized by Newton-Schulz, for 2D hidden weight matrices.
     See Keller Jordan's modded-nanogpt. Embeddings/heads/norms use AdamW instead."""
 
-    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5):
-        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps))
+    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay))
 
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            lr, mom = group["lr"], group["momentum"]
+            lr, mom, wd = group["lr"], group["momentum"], group.get("weight_decay", 0.0)
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -161,6 +170,8 @@ class Muon(torch.optim.Optimizer):
                 upd = _zeropower_via_newtonschulz5(upd, steps=group["ns_steps"])
                 # Scale so the RMS update magnitude is ~LR-invariant to matrix shape.
                 scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                if wd:
+                    p.mul_(1.0 - lr * wd)
                 p.add_(upd, alpha=-lr * scale)
 
 
@@ -179,7 +190,7 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 muon_params.append(p)
             else:
                 norm_params.append(p)
-        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps, weight_decay=getattr(cfg, "muon_weight_decay", 0.0))
         adamw = torch.optim.AdamW(
             [
                 {"params": embed_params, "weight_decay": cfg.weight_decay},
