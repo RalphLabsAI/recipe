@@ -11,7 +11,7 @@
   "micro_batch_size": 8,
   "total_steps": 1000,
   "warmup_steps": 30,
-  "max_lr": 0.004,
+  "max_lr": 0.005,
   "min_lr": 0.0004,
   "log_every": 100
 }
