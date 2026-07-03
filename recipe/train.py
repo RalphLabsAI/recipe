@@ -50,7 +50,11 @@ class TrainConfig:
     total_steps: int = 200
     warmup_steps: int = 20
     max_lr: float = 3e-4
+    embed_lr: float = 3e-4  # AdamW base LR for the token embedding group; equals max_lr unless raised by config
     min_lr: float = 3e-5
+    schedule: str = "cosine"  # "cosine" | "wsd" (linear warmup, hold peak, cosine tail)
+    stable_frac: float = 0.8  # wsd only: fraction of the post-warmup span held at peak LR
+    compile: bool = False  # torch.compile the training module (checkpointing stays eager)
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
@@ -104,6 +108,15 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
+    if cfg.schedule == "wsd":
+        # Warmup-Stable-Decay: hold peak LR for stable_frac of the post-warmup
+        # span, then cosine-decay to min_lr over the tail. At a fixed token
+        # budget this keeps the LR at peak far longer than a cosine that decays
+        # from the first post-warmup step, reaching a lower loss in fewer tokens.
+        if progress <= cfg.stable_frac:
+            return cfg.max_lr
+        decay = (progress - cfg.stable_frac) / max(1e-9, 1.0 - cfg.stable_frac)
+        return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * decay))
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 
@@ -187,9 +200,17 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        for grp in muon.param_groups:
+            grp["base_lr"] = cfg.muon_lr
+        # Token embeddings (group 0) take embed_lr; norms/scalars (group 1) stay
+        # at max_lr. With weight tying the embedding rows update sparsely (one
+        # row per token seen), so they tolerate — and benefit from — a much
+        # higher LR than the dense matmul path. Configs already declare
+        # embed_lr=0.015 but the field was absent from TrainConfig, so the
+        # override loop's hasattr() silently dropped it and embeddings ran at
+        # max_lr; this wires the declared knob.
+        adamw.param_groups[0]["base_lr"] = cfg.embed_lr
+        adamw.param_groups[1]["base_lr"] = cfg.max_lr
         return [muon, adamw]
 
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
@@ -245,6 +266,17 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
 
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
+    # torch.compile for throughput (training-only). Keep the eager module so
+    # grad clipping and checkpoint saves use unprefixed state_dict keys that
+    # load directly into the canonical RalphBase (op4-safe). Falls back to
+    # eager if compile is unavailable in the runtime.
+    _raw_model = model
+    if cfg.compile:
+        try:
+            model = torch.compile(model)
+        except Exception as _ce:
+            print(f"[train] torch.compile unavailable ({_ce}); running eager")
+            model = _raw_model
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -293,7 +325,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             step_loss += loss.item() / cfg.grad_accum_steps
             tokens_seen += cfg.micro_batch_size * cfg.seq_len
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
+        grad_norm = torch.nn.utils.clip_grad_norm_(_raw_model.parameters(), cfg.grad_clip).item()
         for opt in optimizers:
             opt.step()
 
@@ -327,7 +359,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
+            torch.save({"model": _raw_model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
             with (out_dir / "progress.tsv").open("a") as _pf:
                 _pf.write(f"{step}\t{step_loss:.6f}\n")
                 _pf.flush()
@@ -345,7 +377,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": _raw_model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
