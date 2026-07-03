@@ -64,11 +64,30 @@ class TrainConfig:
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
 
+    # LR schedule: "cosine" (default) or "wsd" (warmup -> stable at max_lr ->
+    # linear decay to min_lr over the final decay_frac of steps). WSD reaches a
+    # better final loss than cosine at short token budgets and makes the decay
+    # length an explicit, tunable fraction of the run.
+    schedule: str = "cosine"
+    decay_frac: float = 0.2
+
+    # z-loss coefficient forwarded to the model (see model/_v5wsd.py). 0 = off.
+    logit_z_coef: float = 0.0
+
+    # Untie the LM head from the input embedding. Costs vocab_size*dim extra
+    # params but decouples readout geometry from embedding geometry, which
+    # consistently improves val loss at the 100M-300M scale.
+    tie_embeddings: bool = True
+
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
     data_base_dir: str = "data"
     data_seed: int = 1337
     init_seed: int = 1337
+
+    # torch.compile the model (CUDA only). Off by default: identical math,
+    # kernel fusion only — worth ~1.3-1.5x throughput at the 300M scale.
+    compile: bool = False
 
     # Precision
     use_bf16: bool = True  # bf16 autocast on CUDA; ignored on CPU
@@ -107,6 +126,21 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def wsd_lr(step: int, cfg: TrainConfig) -> float:
+    if step < cfg.warmup_steps:
+        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    decay_steps = max(1, int(cfg.total_steps * cfg.decay_frac))
+    decay_start = cfg.total_steps - decay_steps
+    if step < decay_start:
+        return cfg.max_lr
+    frac = min(1.0, (step - decay_start) / decay_steps)
+    return cfg.max_lr + (cfg.min_lr - cfg.max_lr) * frac
+
+
+def schedule_lr(step: int, cfg: TrainConfig) -> float:
+    return wsd_lr(step, cfg) if cfg.schedule == "wsd" else cosine_lr(step, cfg)
+
+
 def build_model(cfg: TrainConfig) -> RalphBase:
     return RalphBase(RalphConfig(
         vocab_size=cfg.vocab_size,
@@ -116,6 +150,8 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        tie_embeddings=cfg.tie_embeddings,
+        logit_z_coef=cfg.logit_z_coef,
     ))
 
 
@@ -244,6 +280,13 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
+    if not cfg.tie_embeddings and model.lm_head is not None:
+        # Zero-init the untied readout: with the logit soft-cap this starts
+        # training from a uniform predictive distribution, which reliably
+        # improves early loss and the final value at short token budgets.
+        torch.nn.init.zeros_(model.lm_head.weight)
+    if cfg.compile and device.type == "cuda":
+        model = torch.compile(model)
     optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
@@ -271,7 +314,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr = schedule_lr(step, cfg)
         # Scale each optimizer's per-group base_lr by the schedule fraction so
         # the Muon and AdamW groups keep distinct learning rates.
         lr_frac = lr / cfg.max_lr
@@ -327,7 +370,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
+            torch.save({"model": getattr(model, "_orig_mod", model).state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
             with (out_dir / "progress.tsv").open("a") as _pf:
                 _pf.write(f"{step}\t{step_loss:.6f}\n")
                 _pf.flush()
@@ -345,7 +388,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": getattr(model, "_orig_mod", model).state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
