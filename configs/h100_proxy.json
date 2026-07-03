@@ -8,15 +8,16 @@
   "ffn_mult": 2.6875,
   "max_seq_len": 1024,
   "seq_len": 512,
-  "batch_size": 512,
+  "batch_size": 1024,
   "micro_batch_size": 128,
-  "total_steps": 2400,
-  "warmup_steps": 240,
+  "total_steps": 1200,
+  "warmup_steps": 80,
   "max_lr": 0.0008,
   "min_lr": 3e-05,
   "weight_decay": 0.1,
   "beta1": 0.9,
   "beta2": 0.98,
   "grad_clip": 1.0,
-  "log_every": 50
+  "optimizer": "adamw",
+  "log_every": 20
 }
