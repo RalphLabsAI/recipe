@@ -105,7 +105,15 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+    stable_frac = getattr(cfg, "stable_frac", 0.55)
+    if progress <= stable_frac:
+        return cfg.max_lr
+    decay_prog = (progress - stable_frac) / max(1e-9, 1.0 - stable_frac)
+    if getattr(cfg, "decay_curve", "1-sqrt") == "1-sqrt":
+        factor = 1.0 - decay_prog ** 0.5
+    else:
+        factor = 0.5 * (1.0 + math.cos(math.pi * decay_prog))
+    return cfg.min_lr + (cfg.max_lr - cfg.min_lr) * factor
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -142,13 +150,13 @@ class Muon(torch.optim.Optimizer):
     """Momentum orthogonalized by Newton-Schulz, for 2D hidden weight matrices.
     See Keller Jordan's modded-nanogpt. Embeddings/heads/norms use AdamW instead."""
 
-    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5):
-        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps))
+    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay))
 
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            lr, mom = group["lr"], group["momentum"]
+            lr, mom, wd = group["lr"], group["momentum"], group.get("weight_decay", 0.0)
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -161,6 +169,8 @@ class Muon(torch.optim.Optimizer):
                 upd = _zeropower_via_newtonschulz5(upd, steps=group["ns_steps"])
                 # Scale so the RMS update magnitude is ~LR-invariant to matrix shape.
                 scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                if wd:
+                    p.mul_(1.0 - lr * wd)
                 p.add_(upd, alpha=-lr * scale)
 
 
@@ -179,7 +189,7 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 muon_params.append(p)
             else:
                 norm_params.append(p)
-        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps, weight_decay=getattr(cfg, "muon_weight_decay", 0.0))
         adamw = torch.optim.AdamW(
             [
                 {"params": embed_params, "weight_decay": cfg.weight_decay},
@@ -244,8 +254,9 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     set_determinism(cfg.init_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = build_model(cfg).to(device)
-    optimizers = build_optimizer(model, cfg)
+    _raw_model = build_model(cfg).to(device)
+    model = torch.compile(_raw_model) if getattr(cfg, "compile", False) else _raw_model
+    optimizers = build_optimizer(_raw_model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -259,8 +270,8 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     # bf16 has enough dynamic range that no GradScaler is needed (Muon orthogonalizes
     # in bf16 internally; AdamW groups are range-safe), so we step optimizers directly.
 
-    n_params = model.num_parameters()
-    n_params_no_embed = model.num_parameters(exclude_embeddings=True)
+    n_params = _raw_model.num_parameters()
+    n_params_no_embed = _raw_model.num_parameters(exclude_embeddings=True)
     print(f"[train] device={device} params={n_params:,} (no embeddings: {n_params_no_embed:,})")
     print(f"[train] precision={'bf16' if use_amp else 'fp32'}")
     print(f"[train] manifest tokens={ds.total_tokens:,} hash={ds.manifest.manifest_hash()[:16]}…")
@@ -296,7 +307,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             step_loss += loss.item() / cfg.grad_accum_steps
             tokens_seen += cfg.micro_batch_size * cfg.seq_len
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
+        grad_norm = torch.nn.utils.clip_grad_norm_(_raw_model.parameters(), cfg.grad_clip).item()
         for opt in optimizers:
             opt.step()
 
@@ -330,7 +341,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
+            torch.save({"model": _raw_model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
             with (out_dir / "progress.tsv").open("a") as _pf:
                 _pf.write(f"{step}\t{step_loss:.6f}\n")
                 _pf.flush()
@@ -348,7 +359,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": _raw_model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
