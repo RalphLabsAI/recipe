@@ -327,7 +327,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
                 f"|g|={grad_norm:.2f} tok/s={tok_per_s:,.0f}",
                 flush=True,
             )
-        if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
+        if step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
             torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
@@ -350,6 +350,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     ckpt_path = out_dir / "checkpoint.pt"
     torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
+    summary_config = asdict(cfg)
+    summary_config["manifest_path"] = "data/data_manifest.json"
+    summary_config["data_base_dir"] = "data"
+
     summary = {
         "steps": cfg.total_steps,
         "final_loss": last_loss,
@@ -361,7 +365,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         "device": str(device),
         "precision": "bf16" if use_amp else "fp32",
         "wandb_url": wb_url,
-        "config": asdict(cfg),
+        "config": summary_config,
     }
     (out_dir / "final_state.json").write_text(json.dumps(summary, indent=2))
     print(f"[train] done. final loss={last_loss:.4f} wall={summary['wall_clock_s']:.1f}s")
