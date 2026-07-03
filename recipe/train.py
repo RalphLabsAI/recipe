@@ -63,6 +63,12 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    # --- Challenger levers: un-drop config keys the stock loop still ignores ---
+    embed_lr: float = 0.0      # dedicated AdamW LR for tok_embed; 0 => max_lr (stock)
+    schedule: str = "cosine"   # "cosine" (stock) or "wsd" (warmup-stable-decay)
+    stable_frac: float = 0.8   # wsd: fraction of post-warmup steps held at max_lr
+    decay_frac: float = 0.2    # wsd: fraction spent decaying to min_lr
+    compile: bool = False      # torch.compile the model (loss-neutral throughput)
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -100,6 +106,14 @@ def set_determinism(seed: int) -> None:
 
 
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
+    if getattr(cfg, "schedule", "cosine") == "wsd":
+        if step < cfg.warmup_steps:
+            return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+        stable_end = cfg.warmup_steps + int(cfg.stable_frac * (cfg.total_steps - cfg.warmup_steps))
+        if step < stable_end:
+            return cfg.max_lr
+        dp = min(1.0, max(0.0, (step - stable_end) / max(1, cfg.total_steps - stable_end)))
+        return cfg.min_lr + (cfg.max_lr - cfg.min_lr) * (1.0 - math.sqrt(dp))
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
@@ -179,17 +193,18 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
             else:
                 norm_params.append(p)
         muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        emb_lr = cfg.embed_lr if getattr(cfg, "embed_lr", 0.0) > 0 else cfg.max_lr  # un-drop embed_lr
         adamw = torch.optim.AdamW(
             [
-                {"params": embed_params, "weight_decay": cfg.weight_decay},
-                {"params": norm_params, "weight_decay": 0.0},
+                {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": emb_lr},
+                {"params": norm_params, "weight_decay": 0.0, "lr": cfg.max_lr},
             ],
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        muon.param_groups[0]["base_lr"] = cfg.muon_lr
+        adamw.param_groups[0]["base_lr"] = emb_lr
+        adamw.param_groups[1]["base_lr"] = cfg.max_lr
         return [muon, adamw]
 
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
@@ -244,7 +259,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
-    optimizers = build_optimizer(model, cfg)
+    _raw_model = model  # eager alias for grad-clip / state_dict (unprefixed keys)
+    if getattr(cfg, "compile", False) and device.type == "cuda":
+        model = torch.compile(model)  # loss-neutral throughput
+    optimizers = build_optimizer(_raw_model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -280,7 +298,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
                 g["lr"] = g["base_lr"] * lr_frac
             opt.zero_grad(set_to_none=True)
 
-        step_loss = 0.0
+        step_loss_t = torch.zeros((), device=device)  # accumulate on-device (1 host sync/step)
         for accum in range(cfg.grad_accum_steps):
             sub_step = step * cfg.grad_accum_steps + accum
             inp, tgt = ds.get_batch(sub_step, cfg.micro_batch_size)
@@ -290,10 +308,11 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
                 _, loss = model(inp, targets=tgt)
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()
-            step_loss += loss.item() / cfg.grad_accum_steps
+            step_loss_t += loss.detach() / cfg.grad_accum_steps  # no per-microstep .item()
             tokens_seen += cfg.micro_batch_size * cfg.seq_len
+        step_loss = step_loss_t.item()  # single host sync per step
 
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
+        grad_norm = torch.nn.utils.clip_grad_norm_(_raw_model.parameters(), cfg.grad_clip).item()
         for opt in optimizers:
             opt.step()
 
@@ -327,7 +346,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
+            torch.save({"model": _raw_model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
             with (out_dir / "progress.tsv").open("a") as _pf:
                 _pf.write(f"{step}\t{step_loss:.6f}\n")
                 _pf.flush()
@@ -345,7 +364,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": _raw_model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
