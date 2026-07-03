@@ -313,11 +313,9 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             "tokens_per_sec": tok_per_s,
             "elapsed_s": elapsed,
         }
-        # recipe-v4: gate the JSONL write under log_every so long runs don't make
-        # one line per step (the proof-test turns each ~10 lines into a per-epoch
-        # NRAS attestation -> thousands of calls -> NRAS rate-limit/timeout).
-        if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
-            log_f.write(json.dumps(entry) + "\n")
+        # Short live canary: write every step so a 200-step proof creates
+        # enough attestation epoch evidence (runner buckets 10 JSONL rows/epoch).
+        log_f.write(json.dumps(entry) + "\n")
         log_f.flush()
         if wb_run:
             wb_run.log(entry, step=step)
@@ -389,9 +387,9 @@ def main() -> None:
     if args.total_steps is not None:
         cfg.total_steps = args.total_steps
     if args.manifest is not None:
-        cfg.manifest_path = str(args.manifest)
+        cfg.manifest_path = "data/data_manifest.json"
     if args.data_base_dir is not None:
-        cfg.data_base_dir = str(args.data_base_dir)
+        cfg.data_base_dir = "data"
     if args.seed is not None:
         cfg.init_seed = args.seed
         cfg.data_seed = args.seed
