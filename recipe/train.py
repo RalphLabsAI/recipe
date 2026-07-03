@@ -389,9 +389,11 @@ def main() -> None:
     if args.total_steps is not None:
         cfg.total_steps = args.total_steps
     if args.manifest is not None:
-        cfg.manifest_path = str(args.manifest)
+        # The proof runner executes from the copied recipe workdir, which contains
+        # the canonical data/ tree. Keep paths container-relative for validation.
+        cfg.manifest_path = "data/data_manifest.json"
     if args.data_base_dir is not None:
-        cfg.data_base_dir = str(args.data_base_dir)
+        cfg.data_base_dir = "data"
     if args.seed is not None:
         cfg.init_seed = args.seed
         cfg.data_seed = args.seed
