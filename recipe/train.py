@@ -252,6 +252,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     log_path = out_dir / "training_log.jsonl"
     log_f = log_path.open("w")
 
+    artifact_config = asdict(cfg)
+    artifact_config["manifest_path"] = "data/data_manifest.json"
+    artifact_config["data_base_dir"] = "data"
+
     wb_run = _init_wandb(cfg, out_dir, use_wandb)
 
     use_amp = cfg.use_bf16 and device.type == "cuda" and torch.cuda.is_bf16_supported()
@@ -348,7 +352,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": model.state_dict(), "config": artifact_config}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
@@ -361,7 +365,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         "device": str(device),
         "precision": "bf16" if use_amp else "fp32",
         "wandb_url": wb_url,
-        "config": asdict(cfg),
+        "config": artifact_config,
     }
     (out_dir / "final_state.json").write_text(json.dumps(summary, indent=2))
     print(f"[train] done. final loss={last_loss:.4f} wall={summary['wall_clock_s']:.1f}s")
