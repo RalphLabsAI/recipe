@@ -1,0 +1,17 @@
+{
+  "vocab_size": 50257,
+  "dim": 512,
+  "n_layers": 8,
+  "n_heads": 8,
+  "head_dim": 64,
+  "ffn_mult": 2.0,
+  "max_seq_len": 512,
+  "seq_len": 512,
+  "batch_size": 32,
+  "micro_batch_size": 32,
+  "total_steps": 30,
+  "warmup_steps": 5,
+  "max_lr": 0.003,
+  "min_lr": 0.0003,
+  "log_every": 1
+}
