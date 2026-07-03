@@ -56,6 +56,24 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
 
+    # LR schedule. "cosine" = warmup then cosine decay to min_lr (legacy
+    # default). "wsd" = warmup → stable at max_lr → linear decay to min_lr over
+    # the last `decay_frac` of post-warmup steps (Warmup-Stable-Decay; the
+    # schedule every Muon-era config has declared since recipe-v0.2.0 but which
+    # this loop previously ignored, silently running cosine instead).
+    schedule: str = "cosine"
+    stable_frac: float = 0.8   # informational; decay_frac is authoritative
+    decay_frac: float = 0.2    # fraction of post-warmup steps spent decaying
+
+    # Separate AdamW LR for the (tied) token-embedding / unembedding matrix.
+    # The canonical loop trained it at `max_lr` (3e-4) — far too low for a
+    # Muon recipe, where the hidden matrices learn fast under orthogonalized
+    # updates while the embedding lags. Configs have declared embed_lr=0.015
+    # since the Muon era; honoring it trains the embedding ~50x faster.
+    # None / <=0  => fall back to max_lr (legacy behaviour).
+    embed_lr: float | None = None
+    embed_optimizer: str = "adamw"  # accepted for config fidelity (AdamW path)
+
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
     # val_bpb vs AdamW at the h100_proxy scale). "adamw" = AdamW on everything.
@@ -72,9 +90,31 @@ class TrainConfig:
 
     # Precision
     use_bf16: bool = True  # bf16 autocast on CUDA; ignored on CPU
+    compile: bool = False  # torch.compile forward (~2x H100); state_dict from uncompiled module (op4-safe)
 
     # Logging
     log_every: int = 10
+
+    # --- EMA-stack (non-structural training-method knobs; recipe-v5) ---
+    # All default to OFF so an un-configured run is byte-identical to clean_v4.
+    # ema: maintain an exponential moving average of the RAW model params over
+    # the decay phase and save THAT as the final checkpoint (the "S" of WSD done
+    # in weight space — averaged weights over the low-LR tail generalize better).
+    ema: bool = False
+    ema_decay: float = 0.999
+    # z_loss: tiny auxiliary logsumexp**2 penalty that keeps the softmax
+    # normalizer near 1, stabilizing logit scale under Muon (graph-only; the
+    # LOGGED loss stays pure CE so the trajectory is comparable to clean_v4).
+    z_loss_coef: float = 0.0
+    # data_curriculum: "random" (clean_v4, random windows) or "packed"
+    # (per-epoch permutation of non-overlapping packed windows — deterministic
+    # in (data_seed, step), audit-reproducible).
+    data_curriculum: str = "random"
+    # custom_embed_init: re-init nn.Embedding weights with a chosen std AFTER
+    # build_model (deterministic under init_seed). Non-structural: touches only
+    # existing parameter *values*, never shapes/keys.
+    custom_embed_init: bool = False
+    embed_init_std: float | None = None
 
     @property
     def grad_accum_steps(self) -> int:
@@ -99,12 +139,38 @@ def set_determinism(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def cosine_lr(step: int, cfg: TrainConfig) -> float:
+def schedule_frac(step: int, cfg: TrainConfig) -> float:
+    """LR multiplier in [floor, 1.0] applied to every optimizer group's base_lr,
+    where floor = min_lr / max_lr. Supports "cosine" (legacy) and "wsd".
+
+    The multiplier is shape-only: each group keeps its own base_lr (muon_lr,
+    embed_lr, max_lr) and is scaled by this fraction, so Muon, the embedding
+    AdamW group, and the norm AdamW group decay together but keep distinct peaks.
+    """
+    floor = (cfg.min_lr / cfg.max_lr) if cfg.max_lr > 0 else 0.0
     if step < cfg.warmup_steps:
-        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
-    progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
-    progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+        return (step + 1) / max(1, cfg.warmup_steps)
+
+    post = step - cfg.warmup_steps
+    total_post = max(1, cfg.total_steps - cfg.warmup_steps)
+
+    if cfg.schedule == "wsd":
+        decay_steps = max(1, int(round(cfg.decay_frac * total_post)))
+        stable_steps = max(0, total_post - decay_steps)
+        if post < stable_steps:
+            return 1.0
+        dprog = min(1.0, max(0.0, (post - stable_steps) / max(1, decay_steps)))
+        return floor + (1.0 - floor) * (1.0 - dprog)  # linear decay to floor
+
+    # cosine (default / legacy)
+    progress = min(1.0, max(0.0, post / total_post))
+    return floor + 0.5 * (1.0 - floor) * (1 + math.cos(math.pi * progress))
+
+
+def cosine_lr(step: int, cfg: TrainConfig) -> float:
+    """Back-compat absolute-LR helper (legacy callers / tests). Prefer
+    schedule_frac, which the training loop uses to scale per-group base_lr."""
+    return cfg.max_lr * schedule_frac(step, cfg)
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -117,6 +183,74 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
     ))
+
+
+def _ema_start_step(cfg: TrainConfig) -> int:
+    """First step at which EMA accumulation begins. For the "wsd" schedule this
+    is exactly the decay onset (warmup + stable steps), computed to MIRROR
+    schedule_frac's decay boundary bit-for-bit (same round/int math), so the EMA
+    averages precisely over the low-LR decay tail. For any other schedule we
+    start at the midpoint of the post-warmup steps."""
+    total_post = cfg.total_steps - cfg.warmup_steps
+    if cfg.schedule == "wsd":
+        decay_steps = max(1, int(round(cfg.decay_frac * total_post)))
+        stable_steps = total_post - decay_steps
+        return cfg.warmup_steps + stable_steps
+    return cfg.warmup_steps + int(0.5 * total_post)
+
+
+def apply_embed_init(model: torch.nn.Module, cfg: TrainConfig) -> None:
+    """Optionally re-initialize every nn.Embedding's weight with a chosen std.
+    Deterministic under cfg.init_seed (seeded FIRST so the draw is reproducible
+    on audit). Non-structural: only touches existing embedding *values*."""
+    if not getattr(cfg, "custom_embed_init", False):
+        return
+    torch.manual_seed(cfg.init_seed)
+    std = cfg.embed_init_std if cfg.embed_init_std else (cfg.dim ** -0.5)
+    for m in model.modules():
+        if isinstance(m, torch.nn.Embedding):
+            m.weight.data.normal_(mean=0.0, std=std)
+
+
+class PackedWindowOrder:
+    """Deterministic packed-window curriculum over a TokenShardDataset.
+
+    Splits the token stream into N = total_tokens // (seq_len+1) non-overlapping
+    packed windows and, each epoch, visits a fresh permutation of those windows
+    (keyed by (seed, 7000+epoch) so re-derivation on audit is exact). Windows are
+    read via the dataset's existing `_read_range` and split into (input, target)
+    exactly like `get_batch`, so the shard byte-content binding is unchanged.
+    """
+
+    def __init__(self, ds: TokenShardDataset, seq_len: int, seed: int):
+        self.ds = ds
+        self.seq_len = seq_len
+        self.seed = int(seed)
+        self.N = max(1, ds.total_tokens // (seq_len + 1))
+        self._epoch = -1
+        self._perm = None
+
+    def _perm_for_epoch(self, epoch: int) -> np.ndarray:
+        if epoch != self._epoch:
+            rng = np.random.default_rng(np.array([self.seed, 7000 + epoch], dtype=np.uint64))
+            self._perm = rng.permutation(self.N)
+            self._epoch = epoch
+        return self._perm
+
+    def batch(self, sub_step: int, mb: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (B=mb, T=seq_len) input/target tensors for micro-step `sub_step`,
+        deterministically derived from (seed, sub_step)."""
+        inputs = np.empty((mb, self.seq_len), dtype=np.int64)
+        targets = np.empty((mb, self.seq_len), dtype=np.int64)
+        for b in range(mb):
+            flat = sub_step * mb + b
+            epoch = flat // self.N
+            perm = self._perm_for_epoch(epoch)
+            w = int(perm[flat % self.N])
+            chunk = self.ds._read_range(w * (self.seq_len + 1), self.seq_len + 1).astype(np.int64)
+            inputs[b] = chunk[:-1]
+            targets[b] = chunk[1:]
+        return torch.from_numpy(inputs), torch.from_numpy(targets)
 
 
 def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
@@ -167,6 +301,12 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
     """Returns a LIST of optimizers stepped together. Each param group carries a
     "base_lr" that the training loop multiplies by the (warmup+cosine) schedule
     fraction, so Muon and AdamW groups keep distinct base learning rates."""
+    # Resolve the embedding/unembedding LR: honor cfg.embed_lr when set,
+    # otherwise fall back to max_lr (legacy behaviour). Each AdamW group below
+    # carries its own base_lr so the schedule multiplier scales them in lockstep
+    # while preserving distinct peak LRs (embedding vs norms vs Muon hidden).
+    embed_lr = cfg.embed_lr if (cfg.embed_lr is not None and cfg.embed_lr > 0) else cfg.max_lr
+
     if cfg.optimizer == "muon":
         muon_params, embed_params, norm_params = [], [], []
         for n, p in model.named_parameters():
@@ -181,29 +321,40 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
         muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
         adamw = torch.optim.AdamW(
             [
-                {"params": embed_params, "weight_decay": cfg.weight_decay},
-                {"params": norm_params, "weight_decay": 0.0},
+                {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": embed_lr},
+                {"params": norm_params, "weight_decay": 0.0, "lr": cfg.max_lr},
             ],
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        for grp in muon.param_groups:
+            grp["base_lr"] = cfg.muon_lr
+        for grp in adamw.param_groups:
+            grp["base_lr"] = grp["lr"]  # per-group peak (embed_lr vs max_lr)
         return [muon, adamw]
 
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
+    # Pure-AdamW path: separate the (tied) embedding so it can take embed_lr too.
+    embed_params, decay_params, no_decay_params = [], [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "tok_embed" in n or "lm_head" in n:
+            embed_params.append(p)
+        elif p.dim() >= 2:
+            decay_params.append(p)
+        else:
+            no_decay_params.append(p)
     adamw = torch.optim.AdamW(
         [
-            {"params": decay_params, "weight_decay": cfg.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
+            {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": embed_lr},
+            {"params": decay_params, "weight_decay": cfg.weight_decay, "lr": cfg.max_lr},
+            {"params": no_decay_params, "weight_decay": 0.0, "lr": cfg.max_lr},
         ],
         lr=cfg.max_lr,
         betas=(cfg.beta1, cfg.beta2),
     )
     for grp in adamw.param_groups:
-        grp["base_lr"] = cfg.max_lr
+        grp["base_lr"] = grp["lr"]
     return [adamw]
 
 
@@ -239,13 +390,34 @@ def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | No
         return None
 
 
-def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
+def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False,
+          manifest_override: str | None = None,
+          data_base_dir_override: str | None = None) -> dict:
     set_determinism(cfg.init_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
+    # Optional custom embedding re-init (deterministic under init_seed). Runs on
+    # the RAW model AFTER build_model and BEFORE compile / optimizer construction
+    # so the optimizer sees the re-initialized weights.
+    apply_embed_init(model, cfg)
+    raw_model = model  # `model` is always the uncompiled module; keep an explicit
+    #                    handle so EMA / state_dict never touch the compiled wrapper.
+    fwd = torch.compile(model) if getattr(cfg,'compile',False) else model
     optimizers = build_optimizer(model, cfg)
-    ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
+    # Runner-supplied absolute paths are used for LOADING only; cfg keeps its
+    # container-relative contract so the recorded config (checkpoint + final_state)
+    # is identical and never post-hoc rewritten.
+    _load_manifest = manifest_override or cfg.manifest_path
+    _load_data_dir = data_base_dir_override or cfg.data_base_dir
+    ds = TokenShardDataset(_load_manifest, _load_data_dir, cfg.seq_len, cfg.data_seed)
+    # Packed-window curriculum (deterministic in (data_seed, step)); None => the
+    # clean_v4 random-window path via ds.get_batch.
+    order = PackedWindowOrder(ds, cfg.seq_len, cfg.data_seed) \
+        if getattr(cfg, "data_curriculum", "random") == "packed" else None
+    # EMA bookkeeping (built lazily from RAW params on first hit past ema_start).
+    ema_state = None
+    ema_start = _ema_start_step(cfg) if cfg.ema else None
 
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "training_log.jsonl"
@@ -271,31 +443,50 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr_frac = schedule_frac(step, cfg)
+        lr = cfg.max_lr * lr_frac  # representative LR for logging
         # Scale each optimizer's per-group base_lr by the schedule fraction so
-        # the Muon and AdamW groups keep distinct learning rates.
-        lr_frac = lr / cfg.max_lr
+        # the Muon and AdamW (embedding / norm) groups keep distinct peak LRs.
         for opt in optimizers:
             for g in opt.param_groups:
                 g["lr"] = g["base_lr"] * lr_frac
             opt.zero_grad(set_to_none=True)
 
         step_loss = 0.0
+        zc = getattr(cfg, "z_loss_coef", 0.0)
         for accum in range(cfg.grad_accum_steps):
             sub_step = step * cfg.grad_accum_steps + accum
-            inp, tgt = ds.get_batch(sub_step, cfg.micro_batch_size)
+            inp, tgt = (order.batch(sub_step, cfg.micro_batch_size)
+                        if order is not None
+                        else ds.get_batch(sub_step, cfg.micro_batch_size))
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                _, loss = model(inp, targets=tgt)
-            scaled_loss = loss / cfg.grad_accum_steps
-            scaled_loss.backward()
+                logits, loss = fwd(inp, targets=tgt)
+            # LOG pure CE (comparable to clean_v4) BEFORE adding the z-loss term.
             step_loss += loss.item() / cfg.grad_accum_steps
+            # Graph-only auxiliary z-loss (keeps the softmax normalizer ~1).
+            if zc > 0:
+                z = (torch.logsumexp(logits.float().view(-1, logits.size(-1)), -1) ** 2).mean()
+                train_loss = loss + zc * z
+            else:
+                train_loss = loss
+            (train_loss / cfg.grad_accum_steps).backward()
             tokens_seen += cfg.micro_batch_size * cfg.seq_len
 
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
         for opt in optimizers:
             opt.step()
+
+        # EMA update on the RAW params, only over the decay tail (step>=ema_start).
+        if cfg.ema and step >= ema_start:
+            with torch.no_grad():
+                if ema_state is None:
+                    ema_state = {n: p.detach().float().clone()
+                                 for n, p in raw_model.named_parameters()}
+                else:
+                    for n, p in raw_model.named_parameters():
+                        ema_state[n].lerp_(p.detach().float(), 1.0 - cfg.ema_decay)
 
         last_loss = step_loss
         elapsed = time.time() - start
@@ -327,7 +518,8 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         if (step % 2000 == 0 and step > 0) or step == cfg.total_steps - 1:
             _ckpt_dir = out_dir / "checkpoints"
             _ckpt_dir.mkdir(exist_ok=True)
-            torch.save({"model": model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
+            # Mid-run checkpoints stay RAW (uncompiled state_dict, op4-safe keys).
+            torch.save({"model": raw_model.state_dict(), "config": asdict(cfg), "step": step}, _ckpt_dir / f"step_{step:06d}.pt")
             with (out_dir / "progress.tsv").open("a") as _pf:
                 _pf.write(f"{step}\t{step_loss:.6f}\n")
                 _pf.flush()
@@ -344,8 +536,22 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             print(f"[train] wandb export failed ({e}), continuing")
         wb_run.finish()
 
+    # Final save. state_dict keys == named_parameters for RalphBase (rope_cache is
+    # a non-persistent buffer), but we still guard `k in ema_state` so any
+    # persistent buffer a future model adds falls back to the raw tensor cleanly.
+    # EMA tensors are float; cast back to each param's own dtype before saving.
+    raw_sd = raw_model.state_dict()
+    if cfg.ema and ema_state is not None:
+        save_sd = {k: (ema_state[k].to(raw_sd[k].dtype) if k in ema_state else raw_sd[k])
+                   for k in raw_sd}
+    else:
+        save_sd = raw_sd
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    torch.save({"model": save_sd, "config": asdict(cfg)}, ckpt_path)
+    # Also persist the RAW (non-EMA) weights for offline A/B against the EMA save.
+    _ckpt_dir = out_dir / "checkpoints"
+    _ckpt_dir.mkdir(exist_ok=True)
+    torch.save({"model": raw_sd, "config": asdict(cfg)}, _ckpt_dir / "step_final_raw.pt")
 
     summary = {
         "steps": cfg.total_steps,
@@ -360,6 +566,9 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         "wandb_url": wb_url,
         "config": asdict(cfg),
     }
+    # cfg keeps the container-relative contract ("data/…"), NOT overwritten by the
+    # runner's absolute load paths, so summary["config"] is already canonical-relative
+    # and byte-identical to the checkpoint's config — no post-hoc rewrite needed.
     (out_dir / "final_state.json").write_text(json.dumps(summary, indent=2))
     print(f"[train] done. final loss={last_loss:.4f} wall={summary['wall_clock_s']:.1f}s")
     return summary
@@ -385,15 +594,15 @@ def main() -> None:
                 setattr(cfg, k, v)
     if args.total_steps is not None:
         cfg.total_steps = args.total_steps
-    if args.manifest is not None:
-        cfg.manifest_path = str(args.manifest)
-    if args.data_base_dir is not None:
-        cfg.data_base_dir = str(args.data_base_dir)
     if args.seed is not None:
         cfg.init_seed = args.seed
         cfg.data_seed = args.seed
 
-    train(cfg, args.out_dir, use_wandb=args.wandb)
+    # Runner absolute --manifest/--data-base-dir go to train() as LOAD overrides
+    # only; cfg keeps the container-relative contract (self-consistent recorded config).
+    train(cfg, args.out_dir, use_wandb=args.wandb,
+          manifest_override=(str(args.manifest) if args.manifest is not None else None),
+          data_base_dir_override=(str(args.data_base_dir) if args.data_base_dir is not None else None))
 
 
 if __name__ == "__main__":
