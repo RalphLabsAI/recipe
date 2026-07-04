@@ -1,0 +1,10 @@
+{
+  "_comment": "30-step smoke vs king #865 (recipe-v0.3.2): king526 recipe, tiny batch",
+  "vocab_size": 50257, "dim": 1024, "n_layers": 16, "n_heads": 16, "head_dim": 64, "ffn_mult": 2.6667,
+  "max_seq_len": 1024, "seq_len": 512, "qk_norm": true,
+  "batch_size": 16, "micro_batch_size": 16, "total_steps": 30, "warmup_steps": 5,
+  "optimizer": "muon", "muon_lr": 0.02, "muon_momentum": 0.95,
+  "embed_optimizer": "adamw", "embed_lr": 0.015, "max_lr": 3e-4, "min_lr": 4e-5,
+  "schedule": "wsd", "stable_frac": 0.8, "decay_frac": 0.2, "weight_decay": 0.1,
+  "log_every": 10
+}
