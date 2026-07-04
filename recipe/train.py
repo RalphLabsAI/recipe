@@ -51,6 +51,16 @@ class TrainConfig:
     warmup_steps: int = 20
     max_lr: float = 3e-4
     min_lr: float = 3e-5
+    # Schedule: "cosine" (canonical) or "wsd" (warmup-stable-decay). WSD holds
+    # max_lr flat for `stable_frac` of the post-warmup steps, then cosine-decays
+    # to min_lr over the rest — more effective high-LR steps at a fixed token budget.
+    schedule: str = "cosine"
+    stable_frac: float = 0.75
+    # Dedicated AdamW base LR for the (tied) embedding group; 0 => use max_lr.
+    embed_lr: float = 0.0
+    # Throughput knobs — canonical defaults preserve the deterministic behavior.
+    compile: bool = False
+    determinism: bool = True
     weight_decay: float = 0.1
     beta1: float = 0.9
     beta2: float = 0.95
@@ -105,6 +115,26 @@ def cosine_lr(step: int, cfg: TrainConfig) -> float:
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+
+
+def wsd_lr(step: int, cfg: TrainConfig) -> float:
+    """Warmup-stable-decay: linear warmup -> flat max_lr for `stable_frac` of the
+    post-warmup steps -> cosine decay to min_lr over the remainder."""
+    if step < cfg.warmup_steps:
+        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    post = cfg.total_steps - cfg.warmup_steps
+    stable_n = int(cfg.stable_frac * post)
+    s = step - cfg.warmup_steps
+    if s < stable_n:
+        return cfg.max_lr
+    decay_prog = min(1.0, max(0.0, (s - stable_n) / max(1, post - stable_n)))
+    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * decay_prog))
+
+
+def schedule_lr(step: int, cfg: TrainConfig) -> float:
+    if getattr(cfg, "schedule", "cosine") == "wsd":
+        return wsd_lr(step, cfg)
+    return cosine_lr(step, cfg)
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -187,9 +217,12 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        embed_base = cfg.embed_lr if getattr(cfg, "embed_lr", 0.0) else cfg.max_lr
+        for grp in muon.param_groups:
+            grp["base_lr"] = cfg.muon_lr
+        # AdamW group 0 = embeddings (own base_lr = embed_lr split), group 1 = norms.
+        adamw.param_groups[0]["base_lr"] = embed_base
+        adamw.param_groups[1]["base_lr"] = cfg.max_lr
         return [muon, adamw]
 
     decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
@@ -240,11 +273,23 @@ def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | No
 
 
 def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
-    set_determinism(cfg.init_seed)
+    if getattr(cfg, "determinism", True):
+        set_determinism(cfg.init_seed)
+    else:
+        # Non-deterministic fast path: seed RNG for run-to-run comparability but
+        # allow the cudnn autotuner + non-deterministic kernels for throughput.
+        os.environ["PYTHONHASHSEED"] = str(cfg.init_seed)
+        random.seed(cfg.init_seed)
+        np.random.seed(cfg.init_seed)
+        torch.manual_seed(cfg.init_seed)
+        torch.cuda.manual_seed_all(cfg.init_seed)
+        torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
+    if getattr(cfg, "compile", False) and device.type == "cuda":
+        model = torch.compile(model)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -271,7 +316,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr = schedule_lr(step, cfg)
         # Scale each optimizer's per-group base_lr by the schedule fraction so
         # the Muon and AdamW groups keep distinct learning rates.
         lr_frac = lr / cfg.max_lr
