@@ -55,6 +55,12 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    # --- run3 weapons (patch) ---
+    schedule: str = "cosine"
+    stable_frac: float = 0.8
+    tie_embeddings: bool = True
+    compile: bool = False
+    muon_weight_decay: float = 0.0
 
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
@@ -102,6 +108,13 @@ def set_determinism(seed: int) -> None:
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
     if step < cfg.warmup_steps:
         return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
+    if getattr(cfg, "schedule", "cosine") == "wsd":
+        _stable = int(cfg.total_steps * getattr(cfg, "stable_frac", 0.8))
+        if step < _stable:
+            return cfg.max_lr
+        _dp = (step - _stable) / max(1, cfg.total_steps - _stable)
+        _dp = min(1.0, max(0.0, _dp))
+        return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * _dp))
     progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
     progress = min(1.0, max(0.0, progress))
     return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
@@ -116,6 +129,7 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        tie_embeddings=cfg.tie_embeddings,
     ))
 
 
@@ -141,8 +155,9 @@ class Muon(torch.optim.Optimizer):
     """Momentum orthogonalized by Newton-Schulz, for 2D hidden weight matrices.
     See Keller Jordan's modded-nanogpt. Embeddings/heads/norms use AdamW instead."""
 
-    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5):
-        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps))
+    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5, weight_decay=0.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                                      ns_steps=ns_steps, weight_decay=weight_decay))
 
     @torch.no_grad()
     def step(self):
@@ -160,6 +175,9 @@ class Muon(torch.optim.Optimizer):
                 upd = _zeropower_via_newtonschulz5(upd, steps=group["ns_steps"])
                 # Scale so the RMS update magnitude is ~LR-invariant to matrix shape.
                 scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                wd = group.get("weight_decay", 0.0)
+                if wd:
+                    p.mul_(1.0 - lr * scale * wd)
                 p.add_(upd, alpha=-lr * scale)
 
 
@@ -178,7 +196,8 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 muon_params.append(p)
             else:
                 norm_params.append(p)
-        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps,
+                    weight_decay=getattr(cfg, 'muon_weight_decay', 0.0))
         adamw = torch.optim.AdamW(
             [
                 {"params": embed_params, "weight_decay": cfg.weight_decay},
@@ -245,6 +264,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
 
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
+    train_model = torch.compile(model) if getattr(cfg, "compile", False) else model
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -287,7 +307,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                _, loss = model(inp, targets=tgt)
+                _, loss = train_model(inp, targets=tgt)
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()
             step_loss += loss.item() / cfg.grad_accum_steps
