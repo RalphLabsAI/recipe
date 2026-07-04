@@ -100,7 +100,12 @@ class TrainConfig:
 
     # Precision
     use_bf16: bool = True  # bf16 autocast on CUDA; ignored on CPU
-    compile: bool = False  # torch.compile(mode="max-autotune"); state_dict saved from the UNCOMPILED module (op4-safe, no _orig_mod prefix)
+    compile: bool = False
+    # EMA of the weights over the tail of training; saved as the final
+    # checkpoint when enabled. Window should be SHORTER than the decay phase.
+    ema_decay: float = 0.0
+    ema_start_frac: float = 0.85
+    fast_kernels: bool = False  # torch.compile(mode="max-autotune"); state_dict saved from the UNCOMPILED module (op4-safe, no _orig_mod prefix)
 
     # Logging
     log_every: int = 10
@@ -348,6 +353,11 @@ def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | No
 
 def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     set_determinism(cfg.init_seed)
+    if getattr(cfg, "fast_kernels", False):
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.deterministic = False; torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True; torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     # Enable TF32 tensor-core matmuls (free on H100/H200). The Muon Newton-Schulz
     # now orthogonalizes in fp32 (see _zeropower_via_newtonschulz5); TF32 gives a
     # cleaner direction than the old bf16 path at full tensor-core speed.
@@ -386,6 +396,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         print(f"[train] wandb: {wb_run.url}")
 
     start = time.time()
+    _ema = None
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
@@ -404,19 +415,32 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         step_loss = 0.0
         for accum in range(cfg.grad_accum_steps):
             sub_step = step * cfg.grad_accum_steps + accum
-            inp, tgt = ds.get_batch(sub_step, cfg.micro_batch_size)
-            inp = inp.to(device, non_blocking=True)
-            tgt = tgt.to(device, non_blocking=True)
+            if accum == 0:
+                inp, tgt = ds.get_batch(sub_step, cfg.micro_batch_size)
+                inp = inp.to(device, non_blocking=True)
+                tgt = tgt.to(device, non_blocking=True)
+            else:
+                inp, tgt = _pf_inp, _pf_tgt
+            if accum + 1 < cfg.grad_accum_steps:
+                _pf_inp, _pf_tgt = ds.get_batch(sub_step + 1, cfg.micro_batch_size)
+                _pf_inp = _pf_inp.to(device, non_blocking=True)
+                _pf_tgt = _pf_tgt.to(device, non_blocking=True)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
                 _, loss = fwd(inp, targets=tgt)
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()
-            step_loss += loss.item() / cfg.grad_accum_steps
+            _sl = loss.detach() if accum == 0 else _sl + loss.detach()
             tokens_seen += cfg.micro_batch_size * cfg.seq_len
 
+        step_loss = (_sl / cfg.grad_accum_steps).item()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
         for opt in optimizers:
             opt.step()
+        if cfg.ema_decay and step >= int(cfg.total_steps * cfg.ema_start_frac):
+            if _ema is None:
+                _ema = {k: q.detach().clone().float() for k, q in model.state_dict().items()}
+            for k, q in model.state_dict().items():
+                _ema[k].mul_(cfg.ema_decay).add_(q.detach().float(), alpha=1.0 - cfg.ema_decay)
 
         last_loss = step_loss
         elapsed = time.time() - start
@@ -466,7 +490,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    _sd = model.state_dict()
+    if cfg.ema_decay and _ema is not None:
+        _sd = {k: _ema[k].to(_sd[k].dtype) for k in _sd}
+    torch.save({"model": _sd, "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
