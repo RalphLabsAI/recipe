@@ -36,7 +36,6 @@ class RalphConfig:
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
     tie_embeddings: bool = True
-    qk_norm: bool = True  # per-head RMSNorm on q,k before RoPE (off => no q_norm/k_norm params)
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
     logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
 
@@ -102,10 +101,8 @@ class Attention(nn.Module):
         # attention-logit scale so it can't drift, which is especially important
         # under the Muon optimizer's aggressive orthogonalized updates (see
         # recipe/train.py). Strong synergy with Muon; standard in modern speedruns.
-        self.qk_norm = getattr(cfg, "qk_norm", False)
-        if self.qk_norm:
-            self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
-            self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+        self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
+        self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
@@ -114,9 +111,8 @@ class Attention(nn.Module):
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, hd)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        if self.qk_norm:
-            q = self.q_norm(q)  # QK-norm (per head_dim, before RoPE)
-            k = self.k_norm(k)
+        q = self.q_norm(q)  # QK-norm (per head_dim, before RoPE)
+        k = self.k_norm(k)
         q = apply_rope(q, rope_cache)
         k = apply_rope(k, rope_cache)
         # Causal self-attention via SDPA (uses flash on supported hardware).
@@ -150,8 +146,8 @@ class Block(nn.Module):
         self.ffn = SwiGLU(cfg)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cache)
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.attn_norm(self.attn(x, rope_cache))
+        x = x + self.ffn_norm(self.ffn(x))
         return x
 
 
@@ -176,6 +172,9 @@ class RalphBase(nn.Module):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+        self.logit_scale = nn.Parameter(torch.zeros(()))
+        self.readout_gain = nn.Parameter(torch.zeros(cfg.vocab_size))
+        self.readout_bias = nn.Parameter(torch.zeros(cfg.vocab_size))
         self.register_buffer(
             "rope_cache",
             precompute_rope_cache(cfg.head_dim, cfg.max_seq_len, cfg.rope_base, torch.device("cpu")),
@@ -221,6 +220,8 @@ class RalphBase(nn.Module):
             logits = F.linear(x, self.tok_embed.weight)
         else:
             logits = self.lm_head(x)
+        logits = logits * torch.exp(self.readout_gain) + self.readout_bias
+        logits = logits * torch.exp(self.logit_scale)
         cap = getattr(self.cfg, "logit_softcap", 0.0)  # recipe-v4: logit soft-cap
         if cap and cap > 0:
             logits = cap * torch.tanh(logits / cap)
