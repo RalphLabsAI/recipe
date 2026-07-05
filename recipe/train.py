@@ -21,6 +21,8 @@ import random
 import sys
 import time
 from dataclasses import asdict, dataclass
+
+# Ralph miner canary: dual-apply code patch marker.
 from pathlib import Path
 
 import numpy as np
