@@ -28,8 +28,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from data import TokenShardDataset
-from model import RalphBase, RalphConfig
+from recipe._beatsampler import BeatDataset as TokenShardDataset
+from model._beat import RalphBase, RalphConfig
 
 
 @dataclass
@@ -356,6 +356,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
+    from recipe._beatopt import build_optimizer  # reroute: muon_weight_decay + embed_lr
     optimizers = build_optimizer(model, cfg)
     # torch.compile(mode="max-autotune") on the forward. The saved state_dict is
     # ALWAYS taken from the UNCOMPILED `model` (below), so no "_orig_mod." prefix
