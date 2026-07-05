@@ -35,9 +35,10 @@ class RalphConfig:
     rope_base: float = 100_000.0  # recipe-v4: RoPE-100k (was 10k)
     rms_norm_eps: float = 1e-5
     init_std: float = 0.02
-    tie_embeddings: bool = True
+    tie_embeddings: bool = False
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
     logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
+    logit_z_coef: float = 0.0001  # z-loss on the final logits (0 = off)
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -178,6 +179,8 @@ class RalphBase(nn.Module):
             persistent=False,
         )
         self.apply(self._init_weights)
+        if self.lm_head is not None:
+            nn.init.zeros_(self.lm_head.weight)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -227,6 +230,9 @@ class RalphBase(nn.Module):
                 targets.view(-1),
                 ignore_index=-100,
             )
+            z_coef = getattr(self.cfg, "logit_z_coef", 0.0)
+            if z_coef:
+                loss = loss + z_coef * (torch.logsumexp(logits, dim=-1).float() ** 2).mean()
         return logits, loss
 
 
