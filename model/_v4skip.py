@@ -146,8 +146,8 @@ class Block(nn.Module):
         self.ffn = SwiGLU(cfg)
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cache)
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.attn_norm(self.attn(x, rope_cache))
+        x = x + self.ffn_norm(self.ffn(x))
         return x
 
 
@@ -172,6 +172,21 @@ class RalphBase(nn.Module):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+        # Learned scalar readout temperature for the (tied) head. With weight
+        # tying, the embedding matrix's norm sets BOTH the input-embedding scale
+        # (init_std=0.02) and the readout/logit scale; the model cannot move one
+        # without moving the other. This single scalar decouples the readout gain
+        # from the embedding norm so the softmax temperature is fit directly.
+        # exp() parameterisation keeps it strictly positive; 0-init => gain 1.0,
+        # so the run starts bit-identical to the reordered base and learns away.
+        # Shape () => 1D => routed to AdamW(no-decay) by build_optimizer.
+        self.logit_scale = nn.Parameter(torch.zeros(()))
+        # Per-vocab readout calibration (readcal): per-token multiplicative gain +
+        # additive bias on the tied head. 0-init => exp(0)=1 and +0 => identity at
+        # step 0. Both shape (vocab,) => 1D => AdamW(no-decay). Adds state-dict keys
+        # so op4 routes to the patched-eval path (scored as the real arch).
+        self.readout_gain = nn.Parameter(torch.zeros(cfg.vocab_size))
+        self.readout_bias = nn.Parameter(torch.zeros(cfg.vocab_size))
         self.register_buffer(
             "rope_cache",
             precompute_rope_cache(cfg.head_dim, cfg.max_seq_len, cfg.rope_base, torch.device("cpu")),
@@ -213,21 +228,35 @@ class RalphBase(nn.Module):
             for block in self.blocks:
                 x = block(x, self.rope_cache)
         x = self.final_norm(x)
-        if self.lm_head is None:
-            logits = F.linear(x, self.tok_embed.weight)
-        else:
-            logits = self.lm_head(x)
+        W = self.tok_embed.weight if self.lm_head is None else self.lm_head.weight
         cap = getattr(self.cfg, "logit_softcap", 0.0)  # recipe-v4: logit soft-cap
-        if cap and cap > 0:
-            logits = cap * torch.tanh(logits / cap)
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-100,
-            )
-        return logits, loss
+
+        def _readout(h: torch.Tensor) -> torch.Tensor:
+            # F.linear + per-vocab readout gain/bias + global temperature, then soft-cap.
+            # exp(0)=1 at init so gain/scale start as identity.
+            lg = F.linear(h, W)
+            lg = lg * torch.exp(self.readout_gain) + self.readout_bias
+            lg = lg * torch.exp(self.logit_scale)
+            if cap and cap > 0:
+                lg = cap * torch.tanh(lg / cap)
+            return lg
+
+        if targets is None:
+            # Eval / generation path: full calibrated logits (op4 reads these). UNCHANGED.
+            return _readout(x), None
+
+        # Training path: full cross-entropy. On the H200's 140GB, micro_batch 128 fits
+        # the full (B*T, vocab) logits directly — no chunking/recompute. Chunked CE was
+        # an 80GB-H100 memory workaround that ran ~1.5x slower; on the H200 that extra
+        # wall-time blows the normalized-compute budget (speed_factor 1.49). This is the
+        # same full CE #1271 uses. op4's eval path (targets is None) is unchanged.
+        logits = _readout(x)
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
+        return None, loss
 
 
 # ---------------------------------------------------------------------------
