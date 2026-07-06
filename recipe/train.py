@@ -47,6 +47,8 @@ class TrainConfig:
     seq_len: int = 256
     batch_size: int = 16
     micro_batch_size: int = 16  # gradient accumulation = batch_size / micro_batch_size
+    tie_embeddings: bool = True
+    compile: bool = False
     total_steps: int = 200
     warmup_steps: int = 20
     max_lr: float = 3e-4
@@ -116,6 +118,7 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        tie_embeddings=cfg.tie_embeddings,
     ))
 
 
@@ -244,6 +247,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
+    train_model = torch.compile(model) if getattr(cfg, "compile", False) else model
     optimizers = build_optimizer(model, cfg)
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
@@ -287,7 +291,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                _, loss = model(inp, targets=tgt)
+                _, loss = train_model(inp, targets=tgt)
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()
             step_loss += loss.item() / cfg.grad_accum_steps
