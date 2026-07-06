@@ -38,6 +38,7 @@ class RalphConfig:
     tie_embeddings: bool = True
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
     logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
+    logit_z_coef: float = 0.0001  # z-loss on final logits (no params; 0 = off)
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -172,6 +173,7 @@ class RalphBase(nn.Module):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+        self.register_buffer("logit_prior", torch.zeros(cfg.vocab_size, dtype=torch.float32), persistent=False)
         self.register_buffer(
             "rope_cache",
             precompute_rope_cache(cfg.head_dim, cfg.max_seq_len, cfg.rope_base, torch.device("cpu")),
@@ -217,6 +219,7 @@ class RalphBase(nn.Module):
             logits = F.linear(x, self.tok_embed.weight)
         else:
             logits = self.lm_head(x)
+        logits = logits + self.logit_prior.to(logits.dtype)
         cap = getattr(self.cfg, "logit_softcap", 0.0)  # recipe-v4: logit soft-cap
         if cap and cap > 0:
             logits = cap * torch.tanh(logits / cap)
@@ -227,6 +230,9 @@ class RalphBase(nn.Module):
                 targets.view(-1),
                 ignore_index=-100,
             )
+            z_coef = getattr(self.cfg, "logit_z_coef", 0.0)
+            if z_coef:
+                loss = loss + z_coef * (torch.logsumexp(logits, dim=-1).float() ** 2).mean()
         return logits, loss
 
 
