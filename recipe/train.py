@@ -42,6 +42,9 @@ class TrainConfig:
     head_dim: int = 64
     ffn_mult: float = 8 / 3
     max_seq_len: int = 1024
+    # recipe-v5: modded-nanogpt value embeddings (see model/_v4skip.py).
+    value_embeddings: bool = False
+    ve_lambda_init: float = 0.5
 
     # Training
     seq_len: int = 256
@@ -174,6 +177,8 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        value_embeddings=cfg.value_embeddings,
+        ve_lambda_init=cfg.ve_lambda_init,
     ))
 
 
@@ -260,12 +265,12 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if "tok_embed" in n or "lm_head" in n:
-                embed_params.append(p)
+            if "tok_embed" in n or "lm_head" in n or "value_embed" in n:
+                embed_params.append(p)  # recipe-v5: VE table trains under AdamW like the token embedding
             elif p.dim() >= 2:
                 muon_params.append(p)
             else:
-                norm_params.append(p)
+                norm_params.append(p)  # recipe-v5: ve_lambda (1D) lands here — no-decay AdamW
         muon = Muon(
             muon_params,
             lr=cfg.muon_lr,
@@ -294,7 +299,7 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if "tok_embed" in n or "lm_head" in n:
+        if "tok_embed" in n or "lm_head" in n or "value_embed" in n:
             embed_params.append(p)
         elif p.dim() >= 2:
             decay_params.append(p)

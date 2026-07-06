@@ -38,6 +38,13 @@ class RalphConfig:
     tie_embeddings: bool = True
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
     logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
+    # recipe-v5: modded-nanogpt value embeddings. A separate token-embedding table
+    # is looked up once per forward and blended into every block's attention value
+    # projection with a learned per-layer scalar (ve_lambda). This gives the
+    # attention a direct, position-independent token-identity signal that bypasses
+    # the residual stream. 0 (off) keeps the model bit-identical to the king arch.
+    value_embeddings: bool = False
+    ve_lambda_init: float = 0.5   # per-layer VE blend init (identity-ish; learns)
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -104,13 +111,24 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
         self.k_norm = RMSNorm(cfg.head_dim, cfg.rms_norm_eps)
 
-    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_cache: torch.Tensor,
+        ve: Optional[torch.Tensor] = None,
+        ve_lam: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, T, C = x.shape
         qkv = self.qkv(x)  # (B, T, 3C)
         q, k, v = qkv.split(self.dim, dim=-1)
         q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, hd)
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        # recipe-v5: blend the value-embedding lookup into V (position-independent
+        # token identity), per-head, scaled by the layer's learned ve_lambda.
+        if ve is not None:
+            ve_h = ve.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, T, hd)
+            v = v + ve_lam * ve_h
         q = self.q_norm(q)  # QK-norm (per head_dim, before RoPE)
         k = self.k_norm(k)
         q = apply_rope(q, rope_cache)
@@ -145,8 +163,14 @@ class Block(nn.Module):
         self.ffn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.ffn = SwiGLU(cfg)
 
-    def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn_norm(self.attn(x, rope_cache))
+    def forward(
+        self,
+        x: torch.Tensor,
+        rope_cache: torch.Tensor,
+        ve: Optional[torch.Tensor] = None,
+        ve_lam: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = x + self.attn_norm(self.attn(x, rope_cache, ve, ve_lam))
         x = x + self.ffn_norm(self.ffn(x))
         return x
 
@@ -162,6 +186,16 @@ class RalphBase(nn.Module):
         self.cfg = cfg
         self.tok_embed = nn.Embedding(cfg.vocab_size, cfg.dim)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layers)])
+        # recipe-v5: value embeddings. One extra token-embedding table looked up
+        # once per forward and blended into each block's attention V by a learned
+        # per-layer scalar. ve_lambda_init ~0.5 gives an immediate (non-destructive)
+        # signal that the optimizer then tunes per layer; a layer can zero it out.
+        self.value_embeddings = getattr(cfg, "value_embeddings", False)
+        if self.value_embeddings:
+            self.value_embed = nn.Embedding(cfg.vocab_size, cfg.dim)
+            self.ve_lambda = nn.Parameter(
+                torch.full((cfg.n_layers,), float(getattr(cfg, "ve_lambda_init", 0.5)))
+            )
         # recipe-v4: U-Net skips — one learnable gate per decoder layer, 0-init
         # (starts identical to canonical, learns to use the skips).
         self.unet_skip = getattr(cfg, "unet_skip", False)
@@ -216,17 +250,20 @@ class RalphBase(nn.Module):
     def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         assert idx.shape[-1] <= self.cfg.max_seq_len, f"sequence {idx.shape[-1]} exceeds max_seq_len {self.cfg.max_seq_len}"
         x = self.tok_embed(idx)
+        ve = self.value_embed(idx) if self.value_embeddings else None
         if self.unet_skip:
             n = len(self.blocks); half = n // 2; enc = []
             for i, block in enumerate(self.blocks):
+                lam = self.ve_lambda[i] if self.value_embeddings else None
                 if i < half:
-                    x = block(x, self.rope_cache); enc.append(x)
+                    x = block(x, self.rope_cache, ve, lam); enc.append(x)
                 else:
                     x = x + self.skip_gate[i - half] * enc[n - 1 - i]
-                    x = block(x, self.rope_cache)
+                    x = block(x, self.rope_cache, ve, lam)
         else:
-            for block in self.blocks:
-                x = block(x, self.rope_cache)
+            for i, block in enumerate(self.blocks):
+                lam = self.ve_lambda[i] if self.value_embeddings else None
+                x = block(x, self.rope_cache, ve, lam)
         x = self.final_norm(x)
         if self.lm_head is None:
             logits = F.linear(x, self.tok_embed.weight)
@@ -242,14 +279,18 @@ class RalphBase(nn.Module):
         cap = getattr(self.cfg, "logit_softcap", 0.0)  # recipe-v4: logit soft-cap
         if cap and cap > 0:
             logits = cap * torch.tanh(logits / cap)
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-100,
-            )
-        return logits, loss
+        if targets is None:
+            # Eval / generation path returns full logits (op4 reads these). UNCHANGED.
+            return logits, None
+        # Training path: full CE, but DON'T return the (B*T, vocab) logits — pinning
+        # them across the grad-accum loop OOMs micro_batch 128 on the H200. Same
+        # full-CE the king uses; returning None frees logits right after backward.
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
+        return None, loss
 
 
 # ---------------------------------------------------------------------------
