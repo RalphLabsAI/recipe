@@ -55,6 +55,8 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     grad_clip: float = 1.0
+    ema_decay: float = 0.0        # EMA of weights; 0=off. Saved checkpoint = EMA weights (op4-safe, same keys).
+    ema_start_step: int = 0       # begin EMA accumulation at this step
 
     # LR schedule. "cosine" = warmup then cosine decay to min_lr (legacy default).
     # "wsd" = warmup → stable at max_lr → decay to floor=min_lr/max_lr over the
@@ -348,6 +350,11 @@ def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | No
 
 def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     set_determinism(cfg.init_seed)
+    # Fast kernels want determinism OFF (see model._enable_fast_kernels); force it here
+    # so the state is consistent between compiled forward and backward (torch 2.12 check).
+    torch.use_deterministic_algorithms(False)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
     # Enable TF32 tensor-core matmuls (free on H100/H200). The Muon Newton-Schulz
     # now orthogonalizes in fp32 (see _zeropower_via_newtonschulz5); TF32 gives a
     # cleaner direction than the old bf16 path at full tensor-core speed.
@@ -357,6 +364,9 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
 
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
+    _ema_decay = float(getattr(cfg, 'ema_decay', 0.0) or 0.0)
+    _ema_start = int(getattr(cfg, 'ema_start_step', 0) or 0)
+    _ema = {n: pp.detach().clone().float() for n, pp in model.named_parameters()} if _ema_decay > 0 else None
     # torch.compile(mode="max-autotune") on the forward. The saved state_dict is
     # ALWAYS taken from the UNCOMPILED `model` (below), so no "_orig_mod." prefix
     # leaks into the checkpoint (op4 strict-load safe). Gated on cfg.compile and
@@ -417,6 +427,10 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip).item()
         for opt in optimizers:
             opt.step()
+        if _ema is not None and step >= _ema_start:
+            with torch.no_grad():
+                for _n, _p in model.named_parameters():
+                    _ema[_n].mul_(_ema_decay).add_(_p.detach().float(), alpha=1.0 - _ema_decay)
 
         last_loss = step_loss
         elapsed = time.time() - start
@@ -466,7 +480,13 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    _sd = model.state_dict()
+    if _ema is not None:
+        for _n in _ema:
+            if _n in _sd:
+                _sd[_n] = _ema[_n].to(_sd[_n].dtype)
+        print(f"[train] saved EMA weights (decay={_ema_decay}) as checkpoint", flush=True)
+    torch.save({"model": _sd, "config": asdict(cfg)}, ckpt_path)
 
     summary = {
         "steps": cfg.total_steps,
