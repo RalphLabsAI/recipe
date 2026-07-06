@@ -99,7 +99,8 @@ class TrainConfig:
     init_seed: int = 1337
 
     # Precision
-    use_bf16: bool = True  # bf16 autocast on CUDA; ignored on CPU
+    use_bf16: bool = True
+    fast_kernels: bool = False  # bf16 autocast on CUDA; ignored on CPU
     compile: bool = False  # torch.compile(mode="max-autotune"); state_dict saved from the UNCOMPILED module (op4-safe, no _orig_mod prefix)
 
     # Logging
@@ -353,6 +354,16 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     # cleaner direction than the old bf16 path at full tensor-core speed.
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
+    if getattr(cfg, "fast_kernels", False):
+        # Declared throughput path (config: fast_kernels): non-deterministic cuDNN
+        # autotune + TF32 everywhere. Real faster compute on the same recipe; GPU
+        # training is already non-bit-exact (see set_determinism) and the audit is
+        # tolerance-based. Set ONCE here, before any torch.compile capture.
+        torch.use_deterministic_algorithms(False)
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
