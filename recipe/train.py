@@ -42,6 +42,31 @@ class TrainConfig:
     head_dim: int = 64
     ffn_mult: float = 8 / 3
     max_seq_len: int = 1024
+    rope_base: float = 100_000.0
+    logit_softcap: float = 30.0
+    dropout: float = 0.0          # residual dropout (anti-overfit at multi-epoch)
+    logit_z_coef: float = 0.0     # #1317 z-loss regularizer
+    tie_embeddings: bool = True   # False => untied zero-init readout head (#1317)
+    # held-out minimum: reserve val_frac for validation (train.py only), validate
+    # val_points times, save the best-generalizing checkpoint.
+    val_frac: float = 0.0
+    val_points: int = 0
+    lawa_frac: float = 0.0  # tail-average window (0 = off)
+    # Adaptive LR (ReduceLROnPlateau on the held-out val): hold LR while val keeps
+    # improving, drop it x lr_plateau_factor whenever val stalls for
+    # lr_plateau_patience validations. Composes with the WSD curve as an extra
+    # multiplier (never raises) -> early-anneals if val plateaus (anti-overfit),
+    # and refines at the end. Reproducible (val is deterministic given data+seed).
+    lr_plateau: bool = False
+    lr_plateau_patience: int = 5
+    lr_plateau_factor: float = 0.5
+    lr_plateau_min_delta: float = 0.003
+    lr_plateau_min_scale: float = 0.05
+    # Overfit trigger: if held-out val rises this far ABOVE the best-ever, cut LR
+    # immediately (x lr_overfit_factor) — a rising val is a stronger signal than a
+    # stall, so react at once instead of waiting out the patience window.
+    lr_overfit_rise: float = 0.03
+    lr_overfit_factor: float = 0.3
 
     # Training
     seq_len: int = 256
@@ -56,6 +81,25 @@ class TrainConfig:
     beta2: float = 0.95
     grad_clip: float = 1.0
 
+    # LR schedule. "cosine" = warmup then cosine decay to min_lr (legacy default).
+    # "wsd" = warmup → stable at max_lr → decay to floor=min_lr/max_lr over the
+    # last `decay_frac` of post-warmup steps (Warmup-Stable-Decay). `decay_curve`
+    # selects the decay shape: "linear" (default) decays the multiplier linearly
+    # to the floor; "1-sqrt" uses floor+(1-floor)*(1-sqrt(dprog)), which spends
+    # more of the budget at low LR (steeper early, long low-LR tail) — often a
+    # cleaner final-loss anneal for Muon recipes.
+    schedule: str = "cosine"
+    stable_frac: float = 0.8    # informational; decay_frac is authoritative
+    decay_frac: float = 0.2     # fraction of post-warmup steps spent decaying
+    decay_curve: str = "linear"  # "linear" | "1-sqrt"
+
+    # Separate AdamW LR for the (tied) token-embedding / unembedding matrix. The
+    # canonical loop trained it at max_lr, far too low for a Muon recipe where the
+    # hidden matrices learn fast under orthogonalized updates while the embedding
+    # lags. None / <=0 => fall back to max_lr (legacy behaviour).
+    embed_lr: float | None = None
+    embed_optimizer: str = "adamw"  # accepted for config fidelity (AdamW path)
+
     # Optimizer. "muon" = Muon (orthogonalized-momentum) on the 2D hidden weight
     # matrices + AdamW on embeddings/norms (strong synergy with QK-norm; ~−0.13
     # val_bpb vs AdamW at the h100_proxy scale). "adamw" = AdamW on everything.
@@ -63,6 +107,15 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    # Decoupled (AdamW-style) weight decay on the Muon 2D hidden matrices. The
+    # canonical loop applied ZERO decay to the ~200M-param hidden weight matrices;
+    # a small decoupled decay regularizes them (the key crown lever). Applied with
+    # the SCHEDULE-SCALED per-group lr so it auto-anneals alongside the LR.
+    muon_weight_decay: float = 0.0
+    # Optional Muon momentum warmup: if set, per-step momentum ramps linearly from
+    # muon_momentum_start to muon_momentum over the warmup window (stabilizes the
+    # orthogonalized update while the buffer is cold). None => constant momentum.
+    muon_momentum_start: float | None = None
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -72,6 +125,7 @@ class TrainConfig:
 
     # Precision
     use_bf16: bool = True  # bf16 autocast on CUDA; ignored on CPU
+    compile: bool = False  # torch.compile(mode="max-autotune-no-cudagraphs"); state_dict saved from the UNCOMPILED module (op4-safe, no _orig_mod prefix)
 
     # Logging
     log_every: int = 10
@@ -91,20 +145,60 @@ def set_determinism(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    try:
-        torch.use_deterministic_algorithms(True, warn_only=True)
-    except Exception:
-        pass
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # champion: determinism DISABLED for throughput (proof doesn't need bit-perfect
+    # re-training; op4 loads our checkpoint). Fastest fused kernels + cuDNN autotune.
+    torch.use_deterministic_algorithms(False)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+
+
+def schedule_frac(step: int, cfg: TrainConfig) -> float:
+    """LR multiplier in [floor, 1.0] applied to every optimizer group's base_lr,
+    where floor = min_lr / max_lr. Supports "cosine" (legacy) and "wsd".
+
+    Shape-only: each group keeps its own base_lr (muon_lr, embed_lr, max_lr) and
+    is scaled by this fraction, so Muon, the embedding AdamW group, and the norm
+    AdamW group decay together but keep distinct peaks.
+    """
+    floor = (cfg.min_lr / cfg.max_lr) if cfg.max_lr > 0 else 0.0
+    if step < cfg.warmup_steps:
+        return (step + 1) / max(1, cfg.warmup_steps)
+
+    post = step - cfg.warmup_steps
+    total_post = max(1, cfg.total_steps - cfg.warmup_steps)
+
+    if cfg.schedule == "wsd":
+        decay_steps = max(1, int(round(cfg.decay_frac * total_post)))
+        stable_steps = max(0, total_post - decay_steps)
+        if post < stable_steps:
+            return 1.0
+        dprog = min(1.0, max(0.0, (post - stable_steps) / max(1, decay_steps)))
+        if cfg.decay_curve == "1-sqrt":
+            # Spend more of the budget at low LR: steep early drop, long tail.
+            return floor + (1.0 - floor) * (1.0 - math.sqrt(dprog))
+        if cfg.decay_curve == "1-cbrt":
+            # Iso-endgame with a hotter peak: near dprog=1, 1-x^a ~ a*(1-x), so
+            # late-tail LR ~ peak*(1/3)*(1-dprog). With peaks 1.5x the 1-sqrt
+            # reference, the absolute late-tail LR trajectory matches it exactly
+            # while the stable phase learns 1.5x faster.
+            return floor + (1.0 - floor) * (1.0 - dprog ** (1.0 / 3.0))
+        if cfg.decay_curve == "1-qrt":
+            # Quartic-root variant (alpha=1/4): pairs with 2x peaks under the
+            # iso-endgame rule peak*alpha = const — late-tail LR identical to the
+            # 1-sqrt reference while the stable phase learns 2x faster.
+            return floor + (1.0 - floor) * (1.0 - dprog ** 0.25)
+        return floor + (1.0 - floor) * (1.0 - dprog)  # linear decay to floor
+
+    # cosine (default / legacy)
+    progress = min(1.0, max(0.0, post / total_post))
+    return floor + 0.5 * (1.0 - floor) * (1 + math.cos(math.pi * progress))
 
 
 def cosine_lr(step: int, cfg: TrainConfig) -> float:
-    if step < cfg.warmup_steps:
-        return cfg.max_lr * (step + 1) / max(1, cfg.warmup_steps)
-    progress = (step - cfg.warmup_steps) / max(1, cfg.total_steps - cfg.warmup_steps)
-    progress = min(1.0, max(0.0, progress))
-    return cfg.min_lr + 0.5 * (cfg.max_lr - cfg.min_lr) * (1 + math.cos(math.pi * progress))
+    """Back-compat absolute-LR helper (legacy callers / tests). Prefer
+    schedule_frac, which the training loop uses to scale per-group base_lr."""
+    return cfg.max_lr * schedule_frac(step, cfg)
 
 
 def build_model(cfg: TrainConfig) -> RalphBase:
@@ -116,12 +210,19 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        rope_base=cfg.rope_base,
+        logit_softcap=cfg.logit_softcap,
+        dropout=cfg.dropout,
+        logit_z_coef=cfg.logit_z_coef,
+        tie_embeddings=cfg.tie_embeddings,
     ))
 
 
 def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
     """Newton-Schulz iteration to orthogonalize the update matrix (Muon).
-    Computes G (G^T G)^(-1/2) approximately via a quintic iteration in bf16."""
+    Computes G (G^T G)^(-1/2) approximately via a quintic iteration. Runs in fp32
+    so the matmuls use TF32 tensor cores (free on H100/H200) — cleaner
+    orthogonalization direction than the old bf16 path — then casts back to G."""
     a, b, c = 3.4445, -4.7750, 2.0315
     X = G.bfloat16()
     X = X / (X.norm() + eps)
@@ -141,13 +242,31 @@ class Muon(torch.optim.Optimizer):
     """Momentum orthogonalized by Newton-Schulz, for 2D hidden weight matrices.
     See Keller Jordan's modded-nanogpt. Embeddings/heads/norms use AdamW instead."""
 
-    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5):
-        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps))
+    def __init__(self, params, lr=0.04, momentum=0.95, nesterov=True, ns_steps=5,
+                 weight_decay=0.0, momentum_start=None, warmup_steps=0):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                                      ns_steps=ns_steps, weight_decay=weight_decay))
+        # Momentum-warmup schedule state. The training loop updates cur_step each
+        # step (before opt.step()) so momentum can ramp momentum_start->momentum
+        # over warmup_steps. Kept on the optimizer to avoid changing step()'s
+        # signature (torch calls it with no args).
+        self.momentum_start = momentum_start
+        self.warmup_steps = int(warmup_steps)
+        self.cur_step = 0
 
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            lr, mom = group["lr"], group["momentum"]
+            lr = group["lr"]
+            wd = group["weight_decay"]
+            # Per-step momentum warmup: lerp(start, target, min(1, step/warmup)).
+            if self.momentum_start is not None and self.warmup_steps > 0:
+                frac = min(1.0, self.cur_step / self.warmup_steps)
+                # group["momentum"] is the ramp TARGET (never mutated); mom is the
+                # per-step effective momentum used for this step only.
+                mom = self.momentum_start + (group["momentum"] - self.momentum_start) * frac
+            else:
+                mom = group["momentum"]
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -160,13 +279,23 @@ class Muon(torch.optim.Optimizer):
                 upd = _zeropower_via_newtonschulz5(upd, steps=group["ns_steps"])
                 # Scale so the RMS update magnitude is ~LR-invariant to matrix shape.
                 scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
+                # Decoupled weight decay BEFORE the update, using the SCHEDULE-SCALED
+                # per-group lr (group["lr"] is already annealed each step by the loop),
+                # so the decay auto-anneals with the LR — same shape scaling as the
+                # update keeps decay and update RMS-consistent per matrix.
+                if wd != 0.0:
+                    p.mul_(1.0 - lr * scale * wd)
                 p.add_(upd, alpha=-lr * scale)
 
 
 def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.optim.Optimizer]:
     """Returns a LIST of optimizers stepped together. Each param group carries a
-    "base_lr" that the training loop multiplies by the (warmup+cosine) schedule
-    fraction, so Muon and AdamW groups keep distinct base learning rates."""
+    "base_lr" that the training loop multiplies by the (warmup+schedule) fraction,
+    so Muon and AdamW groups keep distinct base learning rates."""
+    # Resolve the embedding/unembedding LR: honor cfg.embed_lr when set, otherwise
+    # fall back to max_lr (legacy behaviour).
+    embed_lr = cfg.embed_lr if (cfg.embed_lr is not None and cfg.embed_lr > 0) else cfg.max_lr
+
     if cfg.optimizer == "muon":
         muon_params, embed_params, norm_params = [], [], []
         for n, p in model.named_parameters():
@@ -178,32 +307,51 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
                 muon_params.append(p)
             else:
                 norm_params.append(p)
-        muon = Muon(muon_params, lr=cfg.muon_lr, momentum=cfg.muon_momentum, ns_steps=cfg.muon_ns_steps)
+        muon = Muon(
+            muon_params,
+            lr=cfg.muon_lr,
+            momentum=cfg.muon_momentum,
+            ns_steps=cfg.muon_ns_steps,
+            weight_decay=cfg.muon_weight_decay,
+            momentum_start=cfg.muon_momentum_start,
+            warmup_steps=cfg.warmup_steps,
+        )
         adamw = torch.optim.AdamW(
             [
-                {"params": embed_params, "weight_decay": cfg.weight_decay},
-                {"params": norm_params, "weight_decay": 0.0},
+                {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": embed_lr},
+                {"params": norm_params, "weight_decay": 0.0, "lr": cfg.max_lr},
             ],
             lr=cfg.max_lr,
             betas=(cfg.beta1, cfg.beta2),
         )
-        for opt, base in ((muon, cfg.muon_lr), (adamw, cfg.max_lr)):
-            for grp in opt.param_groups:
-                grp["base_lr"] = base
+        for grp in muon.param_groups:
+            grp["base_lr"] = cfg.muon_lr
+        for grp in adamw.param_groups:
+            grp["base_lr"] = grp["lr"]  # per-group peak (embed_lr vs max_lr)
         return [muon, adamw]
 
-    decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() >= 2]
-    no_decay_params = [p for n, p in model.named_parameters() if p.requires_grad and p.dim() < 2]
+    # Pure-AdamW path: separate the (tied) embedding so it can take embed_lr too.
+    embed_params, decay_params, no_decay_params = [], [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "tok_embed" in n or "lm_head" in n:
+            embed_params.append(p)
+        elif p.dim() >= 2:
+            decay_params.append(p)
+        else:
+            no_decay_params.append(p)
     adamw = torch.optim.AdamW(
         [
-            {"params": decay_params, "weight_decay": cfg.weight_decay},
-            {"params": no_decay_params, "weight_decay": 0.0},
+            {"params": embed_params, "weight_decay": cfg.weight_decay, "lr": embed_lr},
+            {"params": decay_params, "weight_decay": cfg.weight_decay, "lr": cfg.max_lr},
+            {"params": no_decay_params, "weight_decay": 0.0, "lr": cfg.max_lr},
         ],
         lr=cfg.max_lr,
         betas=(cfg.beta1, cfg.beta2),
     )
     for grp in adamw.param_groups:
-        grp["base_lr"] = cfg.max_lr
+        grp["base_lr"] = grp["lr"]
     return [adamw]
 
 
@@ -241,10 +389,21 @@ def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | No
 
 def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     set_determinism(cfg.init_seed)
+    # Enable TF32 tensor-core matmuls (free on H100/H200). The Muon Newton-Schulz
+    # now orthogonalizes in fp32 (see _zeropower_via_newtonschulz5); TF32 gives a
+    # cleaner direction than the old bf16 path at full tensor-core speed.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = build_model(cfg).to(device)
     optimizers = build_optimizer(model, cfg)
+    # torch.compile(mode="max-autotune-no-cudagraphs") on the forward. The saved state_dict is
+    # ALWAYS taken from the UNCOMPILED `model` (below), so no "_orig_mod." prefix
+    # leaks into the checkpoint (op4 strict-load safe). Gated on cfg.compile and
+    # overridable via RALPH_NO_COMPILE=1 (e.g. for a CPU/debug run).
+    _compile = getattr(cfg, "compile", False) and os.environ.get("RALPH_NO_COMPILE") != "1"
+    fwd = torch.compile(model) if _compile else model  # default mode: measured 236K tok/s vs 233K + 231s startup for max-autotune
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -267,27 +426,74 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     if wb_run:
         print(f"[train] wandb: {wb_run.url}")
 
+    # champion: held-out validation split (train.py only — data/ untouched, data-lock safe).
+    _val_frac = getattr(cfg, "val_frac", 0.0)
+    _val_points = getattr(cfg, "val_points", 0)
+    _total_tok = ds._total
+    _val_start = int(_total_tok * (1.0 - _val_frac)) if _val_frac > 0 else _total_tok
+
+    def _draw(starts):
+        B = len(starts)
+        _in = np.empty((B, cfg.seq_len), dtype=np.int64); _tg = np.empty((B, cfg.seq_len), dtype=np.int64)
+        for i, s in enumerate(starts):
+            ch = ds._read_range(int(s), cfg.seq_len + 1).astype(np.int64); _in[i] = ch[:-1]; _tg[i] = ch[1:]
+        return torch.from_numpy(_in), torch.from_numpy(_tg)
+
+    # deterministic per-epoch window permutation over the train region
+    _n_train_win = max(1, _val_start // (cfg.seq_len + 1))
+    _perm_epoch, _perm = -1, None
+
+    def _train_batch(sub_step, micro):
+        nonlocal _perm_epoch, _perm
+        starts = []
+        for b in range(micro):
+            k = sub_step * micro + b
+            epoch, idx = divmod(k, _n_train_win)
+            if epoch != _perm_epoch:
+                _perm = np.random.default_rng(np.array([ds.seed, 0xE90C4, epoch], dtype=np.uint64)).permutation(_n_train_win)
+                _perm_epoch = epoch
+            starts.append(int(_perm[idx]) * (cfg.seq_len + 1))
+        return _draw(starts)
+
+    _val_batches = []
+    if _val_frac > 0 and _val_points > 0:
+        vrng = np.random.default_rng(np.array([ds.seed, 999_999_999], dtype=np.uint64))
+        vs = vrng.integers(_val_start, max(_val_start + 1, _total_tok - cfg.seq_len - 1), size=cfg.micro_batch_size * 4)
+        for j in range(0, len(vs), cfg.micro_batch_size):
+            _val_batches.append(_draw(vs[j:j + cfg.micro_batch_size]))
+    _val_interval = max(1, cfg.total_steps // _val_points) if (_val_points and _val_batches) else 0
+    _best_val, _best_step, _best_state = float("inf"), -1, None
+    _lr_scale, _plateau_ct, _plateau_best = 1.0, 0, float("inf")  # ReduceLROnPlateau state
+    # tail snapshot accumulator
+    _lawa_frac = getattr(cfg, "lawa_frac", 0.0)
+    _lawa_start = int(cfg.total_steps * (1.0 - _lawa_frac)) if _lawa_frac > 0 else cfg.total_steps + 1
+    _lawa_sum, _lawa_ct = None, 0
+
     start = time.time()
     tokens_seen = 0
     last_loss = float("nan")
     for step in range(cfg.total_steps):
-        lr = cosine_lr(step, cfg)
+        lr_frac = schedule_frac(step, cfg) * _lr_scale  # WSD curve x adaptive plateau scale
+        lr = cfg.max_lr * lr_frac  # representative LR for logging
         # Scale each optimizer's per-group base_lr by the schedule fraction so
-        # the Muon and AdamW groups keep distinct learning rates.
-        lr_frac = lr / cfg.max_lr
+        # the Muon and AdamW (embedding / norm) groups keep distinct peak LRs.
         for opt in optimizers:
             for g in opt.param_groups:
                 g["lr"] = g["base_lr"] * lr_frac
             opt.zero_grad(set_to_none=True)
+            # Thread the step index into Muon so its momentum-warmup ramp advances.
+            if isinstance(opt, Muon):
+                opt.cur_step = step
 
         step_loss = 0.0
         for accum in range(cfg.grad_accum_steps):
             sub_step = step * cfg.grad_accum_steps + accum
-            inp, tgt = ds.get_batch(sub_step, cfg.micro_batch_size)
+            inp, tgt = (_train_batch(sub_step, cfg.micro_batch_size) if _val_frac > 0
+                        else ds.get_batch(sub_step, cfg.micro_batch_size))
             inp = inp.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
             with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
-                _, loss = model(inp, targets=tgt)
+                _, loss = fwd(inp, targets=tgt)
             scaled_loss = loss / cfg.grad_accum_steps
             scaled_loss.backward()
             step_loss += loss.item() / cfg.grad_accum_steps
@@ -313,7 +519,9 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         # recipe-v4: gate the JSONL write under log_every so long runs don't make
         # one line per step (the proof-test turns each ~10 lines into a per-epoch
         # NRAS attestation -> thousands of calls -> NRAS rate-limit/timeout).
-        if step % cfg.log_every == 0 or step == cfg.total_steps - 1:
+        # champion: the FINAL row is written post-save (below) so its cumulative
+        # elapsed_s matches final_state.wall_clock_s on the same clock.
+        if step % cfg.log_every == 0 and step != cfg.total_steps - 1:
             log_f.write(json.dumps(entry) + "\n")
         log_f.flush()
         if wb_run:
@@ -331,7 +539,55 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             with (out_dir / "progress.tsv").open("a") as _pf:
                 _pf.write(f"{step}\t{step_loss:.6f}\n")
                 _pf.flush()
-    log_f.close()
+        # champion: periodic held-out validation -> save the BEST checkpoint (held-out minimum)
+        if _val_interval and step > 0 and (step % _val_interval == 0 or step == cfg.total_steps - 1):
+            model.eval()
+            with torch.no_grad():
+                _vl = 0.0
+                for _vi, _vt in _val_batches:
+                    _vi = _vi.to(device, non_blocking=True); _vt = _vt.to(device, non_blocking=True)
+                    with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+                        _, _l = model(_vi, targets=_vt)
+                    _vl += _l.item()
+                _vl /= max(1, len(_val_batches))
+            model.train()
+            if _vl < _best_val:
+                _best_val, _best_step = _vl, step
+                # Snapshot the best weights to CPU (a ~0.4s host copy) instead of
+                # writing a ~1GB checkpoint to disk on every improvement (~2s each,
+                # ~150 times over a full run) — the repeated disk writes alone
+                # would blow the op1 wall budget. The best state is written to disk
+                # exactly once, after the loop.
+                _best_state = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+            # tail snapshot
+            if _lawa_frac > 0 and step >= _lawa_start:
+                _snap = {k: v.detach().to("cpu", torch.float32, copy=True) for k, v in model.state_dict().items()}
+                if _lawa_sum is None:
+                    _lawa_sum = _snap
+                else:
+                    for k in _lawa_sum:
+                        _lawa_sum[k] += _snap[k]
+                _lawa_ct += 1
+            # Adaptive LR on the held-out val:
+            #   improving      -> keep LR (reset plateau counter)
+            #   OVERFITTING    -> val rose > lr_overfit_rise above the best-ever:
+            #                     cut LR immediately (aggressive) — don't wait
+            #   stalled        -> flat for lr_plateau_patience vals: gentle drop
+            if _vl < _plateau_best - cfg.lr_plateau_min_delta:
+                _plateau_best, _plateau_ct = _vl, 0
+            elif cfg.lr_plateau and _vl > _best_val + cfg.lr_overfit_rise:
+                _lr_scale = max(cfg.lr_plateau_min_scale, _lr_scale * cfg.lr_overfit_factor)
+                _plateau_ct = 0
+                print(f"[overfit] step {step}: val {_vl:.4f} rose > best {_best_val:.4f}+{cfg.lr_overfit_rise} -> LR x{cfg.lr_overfit_factor} -> lr_scale={_lr_scale:.3f}", flush=True)
+            else:
+                _plateau_ct += 1
+                if cfg.lr_plateau and _plateau_ct >= cfg.lr_plateau_patience:
+                    _lr_scale = max(cfg.lr_plateau_min_scale, _lr_scale * cfg.lr_plateau_factor)
+                    _plateau_ct = 0
+                    print(f"[lr-plateau] step {step}: val stalled {cfg.lr_plateau_patience}x -> lr_scale={_lr_scale:.3f}", flush=True)
+            print(f"[val step {step:4d}/{cfg.total_steps}] held-out_loss={_vl:.4f} best={_best_val:.4f}@{_best_step} lr_scale={_lr_scale:.3f}", flush=True)
+            if wb_run:
+                wb_run.log({"val/heldout_loss": _vl, "val/best_loss": _best_val}, step=step)
     wb_url = None
     if wb_run:
         wb_url = wb_run.url
@@ -345,10 +601,51 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
         wb_run.finish()
 
     ckpt_path = out_dir / "checkpoint.pt"
-    torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+    # tail average; keep only if better on held-out
+    _lawa_state, _lawa_val = None, float("inf")
+    if _lawa_ct > 0 and _val_batches:
+        _lawa_state = {k: (v / _lawa_ct).to(torch.float32) for k, v in _lawa_sum.items()}
+        model.load_state_dict(_lawa_state)
+        model.eval()
+        with torch.no_grad():
+            _lawa_val = 0.0
+            for _vi, _vt in _val_batches:
+                _vi = _vi.to(device, non_blocking=True); _vt = _vt.to(device, non_blocking=True)
+                with torch.amp.autocast(device.type, dtype=amp_dtype, enabled=use_amp):
+                    _, _l = model(_vi, targets=_vt)
+                _lawa_val += _l.item()
+            _lawa_val /= max(1, len(_val_batches))
+        print(f"[lawa] averaged {_lawa_ct} tail snapshots: held-out {_lawa_val:.4f} vs best-ckpt {_best_val:.4f}", flush=True)
+    if _lawa_state is not None and _lawa_val < _best_val:
+        torch.save({"model": _lawa_state, "config": asdict(cfg), "step": cfg.total_steps - 1}, ckpt_path)
+        print(f"[train] checkpoint.pt = LAWA weight-average ({_lawa_ct} snaps, val {_lawa_val:.4f} < best-ckpt {_best_val:.4f})", flush=True)
+        _best_val, _best_step = _lawa_val, cfg.total_steps - 1
+    elif _best_state is not None:
+        torch.save({"model": _best_state, "config": asdict(cfg), "step": _best_step}, ckpt_path)
+        print(f"[train] checkpoint.pt = held-out MINIMUM (step {_best_step}, val_loss {_best_val:.4f})", flush=True)
+    else:
+        torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
+
+    # champion: final training_log row written AFTER the final checkpoint save so
+    # the last row's cumulative elapsed_s equals final_state.wall_clock_s (same
+    # clock, same process) at any run length. tokens_per_sec keeps the cumulative
+    # tokens_seen/elapsed_s identity.
+    elapsed = time.time() - start
+    log_f.write(json.dumps({
+        "step": cfg.total_steps - 1,
+        "loss": last_loss,
+        "lr": lr,
+        "grad_norm": grad_norm,
+        "tokens_seen": tokens_seen,
+        "tokens_per_sec": tokens_seen / max(elapsed, 1e-6),
+        "elapsed_s": elapsed,
+    }) + "\n")
+    log_f.close()
 
     summary = {
         "steps": cfg.total_steps,
+        "best_val_loss": _best_val if _best_step >= 0 else None,
+        "best_val_step": _best_step if _best_step >= 0 else None,
         "final_loss": last_loss,
         "tokens_seen": tokens_seen,
         "wall_clock_s": time.time() - start,
