@@ -103,14 +103,30 @@ class TokenShardDataset:
         ids = torch.from_numpy(chunk.astype(np.int64))
         return ids[:-1], ids[1:]
 
+    def _perm_window_start(self, k: int) -> int:
+        """Start offset of the k-th sample under epoch-wise permutation.
+
+        Non-overlapping windows, reshuffled each epoch with a (seed, epoch)-keyed
+        permutation: every token is seen once per epoch (uniform repeat counts),
+        unlike independent uniform draws which leave ~exp(-epochs) of the corpus
+        unseen. Same determinism contract: order is a pure function of
+        (manifest, seed, seq_len, k), so audit replay is unchanged.
+        """
+        n_win = self._total // (self.seq_len + 1)
+        epoch, idx = divmod(k, n_win)
+        if getattr(self, "_perm_epoch", None) != epoch:
+            prng = np.random.default_rng(np.array([self.seed, 0xE90C4, epoch], dtype=np.uint64))
+            self._perm = prng.permutation(n_win)
+            self._perm_epoch = epoch
+        return int(self._perm[idx]) * (self.seq_len + 1)
+
     def get_batch(
         self,
         step: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return a batch of (B, T) input + target tensors at the given step."""
-        rng = np.random.default_rng(np.array([self.seed, step], dtype=np.uint64))
-        starts = rng.integers(0, self._total, size=batch_size)
+        starts = [self._perm_window_start(step * batch_size + b) for b in range(batch_size)]
         inputs = np.empty((batch_size, self.seq_len), dtype=np.int64)
         targets = np.empty((batch_size, self.seq_len), dtype=np.int64)
         for b, s in enumerate(starts):
