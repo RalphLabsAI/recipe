@@ -503,6 +503,8 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             print(f"[train] wandb export failed ({e}), continuing")
         wb_run.finish()
 
+    cfg.manifest_path = "data/data_manifest.json"
+    cfg.data_base_dir = "data"
     ckpt_path = out_dir / "checkpoint.pt"
     _save_sd = model.state_dict()
     if _ema is not None:  # swap in the averaged PARAMS; keep buffers from the live model
