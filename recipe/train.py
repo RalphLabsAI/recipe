@@ -43,6 +43,12 @@ class TrainConfig:
     n_heads: int = 8
     head_dim: int = 64
     ffn_mult: float = 8 / 3
+    # v16 champion arch gates (forwarded to RalphConfig)
+    value_residual: bool = False
+    peri_ln: bool = False
+    hybrid_norm: bool = False
+    resid_scale: bool = False
+    resid_scale_init: float = 1.0
     max_seq_len: int = 1024
 
     # Training
@@ -197,6 +203,11 @@ def build_model(cfg: TrainConfig) -> RalphBase:
         head_dim=cfg.head_dim,
         ffn_mult=cfg.ffn_mult,
         max_seq_len=cfg.max_seq_len,
+        value_residual=cfg.value_residual,
+        peri_ln=cfg.peri_ln,
+        hybrid_norm=cfg.hybrid_norm,
+        resid_scale=cfg.resid_scale,
+        resid_scale_init=cfg.resid_scale_init,
     ))
 
 
