@@ -1,0 +1,20 @@
+{
+ "vocab_size": 50257,
+ "dim": 1024,
+ "n_layers": 16,
+ "n_heads": 16,
+ "head_dim": 64,
+ "ffn_mult": 2.6667,
+ "max_seq_len": 512,
+ "seq_len": 512,
+ "batch_size": 1024,
+ "micro_batch_size": 128,
+ "total_steps": 5150,
+ "warmup_steps": 100,
+ "max_lr": 0.003,
+ "min_lr": 3e-05,
+ "optimizer": "muon",
+ "muon_lr": 0.025,
+ "muon_momentum": 0.95,
+ "log_every": 50
+}
