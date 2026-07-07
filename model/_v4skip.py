@@ -38,6 +38,8 @@ class RalphConfig:
     tie_embeddings: bool = True
     unet_skip: bool = True        # recipe-v4: U-Net learnable skip connections
     logit_softcap: float = 30.0   # recipe-v4: tanh soft-cap on logits (0 = off)
+    dropout: float = 0.0          # residual dropout (no params; training-only)
+    logit_z_coef: float = 0.0     # #1317 z-loss (no params; training-only)
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -144,10 +146,11 @@ class Block(nn.Module):
         self.attn = Attention(cfg)
         self.ffn_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.ffn = SwiGLU(cfg)
+        self.drop = nn.Dropout(getattr(cfg, "dropout", 0.0))
 
     def forward(self, x: torch.Tensor, rope_cache: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x), rope_cache)
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.drop(self.attn(self.attn_norm(x), rope_cache))
+        x = x + self.drop(self.ffn(self.ffn_norm(x)))
         return x
 
 
@@ -172,6 +175,7 @@ class RalphBase(nn.Module):
             self.lm_head = None
         else:
             self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+            nn.init.zeros_(self.lm_head.weight)  # #1317: zero-init untied head => identity logits at step 0
         self.register_buffer(
             "rope_cache",
             precompute_rope_cache(cfg.head_dim, cfg.max_seq_len, cfg.rope_base, torch.device("cpu")),
@@ -227,6 +231,9 @@ class RalphBase(nn.Module):
                 targets.view(-1),
                 ignore_index=-100,
             )
+            zc = getattr(self.cfg, "logit_z_coef", 0.0)  # #1317 z-loss regularizer
+            if zc:
+                loss = loss + zc * (torch.logsumexp(logits, dim=-1).float() ** 2).mean()
         return logits, loss
 
 
