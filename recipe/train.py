@@ -63,6 +63,12 @@ class TrainConfig:
     muon_lr: float = 0.04
     muon_momentum: float = 0.95
     muon_ns_steps: int = 5
+    # Latest Weight Averaging (LAWA): replace the final snapshot with the mean of
+    # the last `lawa_frac` fraction of periodic checkpoints. The tail of a Muon
+    # run still oscillates around the loss basin; averaging those iterates cancels
+    # that per-step noise and lands a lower, flatter minimum — a consistent
+    # val_bpb gain at zero extra training compute. 0 disables it.
+    lawa_frac: float = 0.0
 
     # Data + reproducibility
     manifest_path: str = "data/data_manifest.json"
@@ -207,6 +213,28 @@ def build_optimizer(model: torch.nn.Module, cfg: TrainConfig) -> list[torch.opti
     return [adamw]
 
 
+def latest_weight_average(ckpt_dir: Path, frac: float) -> dict | None:
+    """Element-wise mean of the model state_dicts from the last `frac` fraction
+    of periodic step checkpoints in `ckpt_dir` (Latest Weight Averaging). Returns
+    None when there are too few checkpoints to average. Averaging is done in fp32
+    for numerical stability, then cast back by the caller."""
+    import glob
+    paths = sorted(glob.glob(str(ckpt_dir / "step_*.pt")))
+    if len(paths) < 2:
+        return None
+    k = max(2, int(round(len(paths) * frac)))
+    tail = paths[-k:]
+    acc: dict | None = None
+    for cp in tail:
+        sd = torch.load(cp, map_location="cpu")["model"]
+        if acc is None:
+            acc = {name: t.float().clone() for name, t in sd.items()}
+        else:
+            for name in acc:
+                acc[name] += sd[name].float()
+    return {name: t / len(tail) for name, t in acc.items()}
+
+
 def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | None:
     if not use_wandb:
         return None
@@ -344,6 +372,13 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
             print(f"[train] wandb export failed ({e}), continuing")
         wb_run.finish()
 
+    # Fold the tail of the trajectory into the final model (LAWA) before saving.
+    if getattr(cfg, "lawa_frac", 0.0) > 0:
+        _avg = latest_weight_average(out_dir / "checkpoints", cfg.lawa_frac)
+        if _avg is not None:
+            _ref = model.state_dict()
+            model.load_state_dict({name: t.to(_ref[name].dtype) for name, t in _avg.items()})
+            print(f"[lawa] merged last {cfg.lawa_frac:.0%} of checkpoints into final model", flush=True)
     ckpt_path = out_dir / "checkpoint.pt"
     torch.save({"model": model.state_dict(), "config": asdict(cfg)}, ckpt_path)
 
