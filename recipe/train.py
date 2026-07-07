@@ -57,11 +57,11 @@ class TrainConfig:
     grad_clip: float = 1.0
 
     # LR schedule. "cosine" = warmup then cosine decay to min_lr (legacy default).
-    # "wsd" = warmup -> stable at max_lr -> decay to floor=min_lr/max_lr over the
+    # "wsd" = warmup → stable at max_lr → decay to floor=min_lr/max_lr over the
     # last `decay_frac` of post-warmup steps (Warmup-Stable-Decay). `decay_curve`
     # selects the decay shape: "linear" (default) decays the multiplier linearly
     # to the floor; "1-sqrt" uses floor+(1-floor)*(1-sqrt(dprog)), which spends
-    # more of the budget at low LR (steeper early, long low-LR tail) -- often a
+    # more of the budget at low LR (steeper early, long low-LR tail) — often a
     # cleaner final-loss anneal for Muon recipes.
     schedule: str = "cosine"
     stable_frac: float = 0.8    # informational; decay_frac is authoritative
@@ -201,8 +201,8 @@ def build_model(cfg: TrainConfig) -> RalphBase:
 def _zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
     """Newton-Schulz iteration to orthogonalize the update matrix (Muon).
     Computes G (G^T G)^(-1/2) approximately via a quintic iteration. Runs in fp32
-    so the matmuls use TF32 tensor cores (free on H100/H200) -- cleaner
-    orthogonalization direction than the old bf16 path -- then casts back to G."""
+    so the matmuls use TF32 tensor cores (free on H100/H200) — cleaner
+    orthogonalization direction than the old bf16 path — then casts back to G."""
     a, b, c = 3.4445, -4.7750, 2.0315
     X = G.bfloat16()
     X = X / (X.norm() + eps)
@@ -261,7 +261,7 @@ class Muon(torch.optim.Optimizer):
                 scale = max(1.0, p.size(0) / p.size(1)) ** 0.5
                 # Decoupled weight decay BEFORE the update, using the SCHEDULE-SCALED
                 # per-group lr (group["lr"] is already annealed each step by the loop),
-                # so the decay auto-anneals with the LR -- same shape scaling as the
+                # so the decay auto-anneals with the LR — same shape scaling as the
                 # update keeps decay and update RMS-consistent per matrix.
                 if wd != 0.0:
                     p.mul_(1.0 - lr * scale * wd)
@@ -368,7 +368,7 @@ def _init_wandb(cfg: TrainConfig, out_dir: Path, use_wandb: bool) -> object | No
 
 
 def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
-    set_determinism(cfg.init_seed, getattr(cfg, "deterministic", True))
+    set_determinism(cfg.init_seed)
     # Enable TF32 tensor-core matmuls (free on H100/H200). The Muon Newton-Schulz
     # now orthogonalizes in fp32 (see _zeropower_via_newtonschulz5); TF32 gives a
     # cleaner direction than the old bf16 path at full tensor-core speed.
@@ -383,14 +383,7 @@ def train(cfg: TrainConfig, out_dir: Path, use_wandb: bool = False) -> dict:
     # leaks into the checkpoint (op4 strict-load safe). Gated on cfg.compile and
     # overridable via RALPH_NO_COMPILE=1 (e.g. for a CPU/debug run).
     _compile = getattr(cfg, "compile", False) and os.environ.get("RALPH_NO_COMPILE") != "1"
-    # compile_mode "max-autotune" is only worth it with deterministic=False (else the
-    # deterministic-kernel clash makes it ~1.8x slower). "default" is the safe fallback.
-    _cmode = getattr(cfg, "compile_mode", "default")
-    fwd = torch.compile(model, mode=_cmode) if _compile else model
-    # EMA state (weight-averaging over the low-LR decay phase).
-    _ema_decay = float(getattr(cfg, "ema_decay", 0.0) or 0.0)
-    _ema_start = int(float(getattr(cfg, "ema_start_frac", 0.0) or 0.0) * cfg.total_steps)
-    _ema = None
+    fwd = torch.compile(model) if _compile else model
     ds = TokenShardDataset(cfg.manifest_path, cfg.data_base_dir, cfg.seq_len, cfg.data_seed)
 
     out_dir.mkdir(parents=True, exist_ok=True)
