@@ -41,6 +41,7 @@ class TokenShardDataset:
         base_dir: Path | str,
         seq_len: int,
         seed: int,
+        sampling: str = "replacement",
     ):
         from .manifest import DataManifest, verify_manifest
 
@@ -54,6 +55,10 @@ class TokenShardDataset:
         self._total = int(self._cum[-1])
         self.seq_len = seq_len
         self.seed = seed
+        self.sampling = sampling
+        self._n_windows = self._total // (self.seq_len + 1)
+        self._perm_epoch = -1
+        self._perm = None
         if self._total < seq_len + 1:
             raise ValueError(f"not enough tokens ({self._total}) for seq_len {seq_len}")
 
@@ -103,14 +108,38 @@ class TokenShardDataset:
         ids = torch.from_numpy(chunk.astype(np.int64))
         return ids[:-1], ids[1:]
 
+    def _perm_for_epoch(self, epoch: int) -> np.ndarray:
+        """Deterministic seed-keyed permutation of the non-overlapping window
+        indices for a given epoch. Re-derivable by the validator on audit from
+        (seed, epoch)."""
+        if self._perm_epoch != epoch:
+            self._perm = np.random.default_rng(
+                np.array([self.seed, 0xE9EC, epoch], dtype=np.uint64)
+            ).permutation(self._n_windows)
+            self._perm_epoch = epoch
+        return self._perm
+
     def get_batch(
         self,
         step: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return a batch of (B, T) input + target tensors at the given step."""
-        rng = np.random.default_rng(np.array([self.seed, step], dtype=np.uint64))
-        starts = rng.integers(0, self._total, size=batch_size)
+        if self.sampling == "permutation":
+            # Without-replacement full-coverage epoching: deal non-overlapping
+            # windows in a seed-keyed shuffled order. Deterministic from
+            # (seed, seq_len, batch_size, step) -> validator re-derivable.
+            stride = self.seq_len + 1
+            starts = np.empty(batch_size, dtype=np.int64)
+            for b in range(batch_size):
+                p = step * batch_size + b
+                epoch = p // self._n_windows
+                within = p % self._n_windows
+                win = int(self._perm_for_epoch(epoch)[within])
+                starts[b] = win * stride
+        else:
+            rng = np.random.default_rng(np.array([self.seed, step], dtype=np.uint64))
+            starts = rng.integers(0, self._total, size=batch_size)
         inputs = np.empty((batch_size, self.seq_len), dtype=np.int64)
         targets = np.empty((batch_size, self.seq_len), dtype=np.int64)
         for b, s in enumerate(starts):
